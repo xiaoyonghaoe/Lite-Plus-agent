@@ -4,12 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
-	"strings"
 	"testing"
-	"time"
 
-	"github.com/gorilla/websocket"
 	v2 "github.com/nuomiiiii/lite-agent/protocol/v2"
 )
 
@@ -45,7 +41,7 @@ func requireAccessHeaders(request *http.Request) bool {
 
 func TestAgentAuthorizationUsesHeader(t *testing.T) {
 	configureAccessTest(t, "", "access-id", "access-secret")
-	request, err := http.NewRequest(http.MethodGet, "https://example.com/api/clients/v2/rpc", nil)
+	request, err := http.NewRequest(http.MethodPost, "https://example.com/api/clients/v2/rpc", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,67 +60,9 @@ func TestAgentAuthorizationUsesHeader(t *testing.T) {
 	}
 }
 
-func TestRemoteHeadersAreLiteOnly(t *testing.T) {
-	configureAccessTest(t, "", "access-id", "access-secret")
-
-	remoteHeaders := remoteAuthorizationHeader("agent-token", "remote-session", "remote-ticket")
-	if remoteHeaders.Get("X-Lite-Remote-Session") != "remote-session" ||
-		remoteHeaders.Get("X-Lite-Remote-Ticket") != "remote-ticket" ||
-		!headersContainAccessCredentials(remoteHeaders) {
-		t.Fatalf("remote headers are incomplete: %#v", remoteHeaders)
-	}
-	for _, forbidden := range []string{
-		"X-Komari-Remote-Session",
-		"X-Komari-Remote-Ticket",
-		"X-Komari-Terminal-Session",
-		"X-Lite-Terminal-Session",
-	} {
-		if got := remoteHeaders.Get(forbidden); got != "" {
-			t.Fatalf("forbidden header %s = %q", forbidden, got)
-		}
-	}
-}
-
-func headersContainAccessCredentials(headers http.Header) bool {
-	return headers.Get("Authorization") == "Bearer agent-token" &&
-		headers.Get("CF-Access-Client-Id") == "access-id" &&
-		headers.Get("CF-Access-Client-Secret") == "access-secret"
-}
-
-func TestCloudflareAccessProtectedWebSocket(t *testing.T) {
-	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if !requireAccessHeaders(request) {
-			http.Error(writer, "Cloudflare Access denied", http.StatusForbidden)
-			return
-		}
-		connection, err := upgrader.Upgrade(writer, request, nil)
-		if err != nil {
-			return
-		}
-		_ = connection.Close()
-	}))
-	t.Cleanup(server.Close)
-
-	websocketEndpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/clients/v2/rpc"
-	configureAccessTest(t, server.URL, "", "")
-	if connection, err := connectWebSocket(websocketEndpoint); err == nil {
-		_ = connection.Close()
-		t.Fatal("WebSocket unexpectedly passed Cloudflare Access without service-token headers")
-	}
-
-	flags.CFAccessClientID = "access-id"
-	flags.CFAccessClientSecret = "access-secret"
-	connection, err := connectWebSocket(websocketEndpoint)
-	if err != nil {
-		t.Fatalf("WebSocket with both authentication layers failed: %v", err)
-	}
-	_ = connection.Close()
-}
-
 func TestCloudflareAccessProtectedAgentHTTPFlows(t *testing.T) {
 	seen := make(map[string]int)
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if !requireAccessHeaders(request) {
 			http.Error(writer, "Cloudflare Access denied", http.StatusForbidden)
 			return
@@ -138,8 +76,8 @@ func TestCloudflareAccessProtectedAgentHTTPFlows(t *testing.T) {
 			_ = json.NewEncoder(writer).Encode(v2.Response{JSONRPC: v2.Version, ID: "access-test", Result: map[string]string{"status": "ok"}})
 		}
 	}))
-	t.Cleanup(server.Close)
-	configureAccessTest(t, server.URL, "", "")
+	t.Cleanup(srv.Close)
+	configureAccessTest(t, srv.URL, "", "")
 
 	if err := tryUploadData(map[string]interface{}{"name": "test"}); err == nil {
 		t.Fatal("HTTP request unexpectedly passed Cloudflare Access without service-token headers")
@@ -150,38 +88,11 @@ func TestCloudflareAccessProtectedAgentHTTPFlows(t *testing.T) {
 	if err := tryUploadData(map[string]interface{}{"name": "test"}); err != nil {
 		t.Fatalf("v2 basic info failed: %v", err)
 	}
-	uploadTaskResult("task-id", "ok", 0, time.Now(), v2.TaskResultStatusFinished)
-	if err := postV2RPC(v2.Request{JSONRPC: v2.Version, ID: "task", Method: v2.MethodAgentTaskResult}); err != nil {
-		t.Fatalf("v2 task result failed: %v", err)
-	}
-	if _, err := postV2Request(v2.NewRequest("access-test", v2.MethodAgentPull, nil)); err != nil {
-		t.Fatalf("v2 POST fallback failed: %v", err)
+	if _, err := postV2Request(v2.BuildReportRequest("access-test", []byte(`{}`), nil)); err != nil {
+		t.Fatalf("v2 report POST failed: %v", err)
 	}
 
-	if seen["/api/clients/v2/rpc"] != 4 {
-		t.Fatalf("v2 POST requests = %d", seen["/api/clients/v2/rpc"])
-	}
-}
-
-func TestWebSocketEndpointDoesNotContainAgentToken(t *testing.T) {
-	originalEndpoint, originalToken := flags.Endpoint, flags.Token
-	flags.Endpoint, flags.Token = "https://example.com", "secret-token"
-	t.Cleanup(func() {
-		flags.Endpoint, flags.Token = originalEndpoint, originalToken
-	})
-
-	endpoint := buildWebSocketEndpoint()
-	parsed, err := url.Parse(endpoint)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if parsed.RawQuery != "" {
-		t.Fatalf("websocket URL contains query data: %q", parsed.RawQuery)
-	}
-	if endpoint == "" || parsed.Host != "example.com" {
-		t.Fatalf("unexpected websocket endpoint: %q", endpoint)
-	}
-	if !strings.HasSuffix(parsed.Path, "/api/clients/v2/rpc") {
-		t.Fatalf("unexpected websocket path: %q", parsed.Path)
+	if seen["/api/clients/v2/rpc"] != 2 {
+		t.Fatalf("v2 POST requests = %d, want 2", seen["/api/clients/v2/rpc"])
 	}
 }

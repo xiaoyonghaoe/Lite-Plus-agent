@@ -135,7 +135,7 @@ func inboundHasActiveUsers(in InboundSpec, live []UserSpec, xray bool) bool {
 	if proto == "" {
 		proto = "socks"
 	}
-	granted := usersForInbound(live, in.ID)
+	granted := userEntriesForInbound(live, in)
 	switch proto {
 	case "http":
 		if inboundAllowTransparent(in) {
@@ -212,7 +212,7 @@ func evictChangedOrDeadUsers(policy *policyEngine, prevLive, nextLive []UserSpec
 }
 
 func singBoxInboundUsersCoveredByBuilt(in InboundSpec, nextGranted, builtLive []UserSpec) bool {
-	builtGranted := usersForInbound(builtLive, in.ID)
+	builtGranted := userEntriesForInbound(builtLive, in)
 	if len(nextGranted) != len(builtGranted) {
 		return false
 	}

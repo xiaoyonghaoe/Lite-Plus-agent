@@ -183,29 +183,12 @@ func protectionUpgradeEnableLocked(result v2.ProtectionResultParams) v2.Protecti
 	return result
 }
 
-func installOrUpdateNftables(wasActive, wasEnabled bool) error {
+func installOrUpdateNftables(_, _ bool) error {
 	if !privileged() {
 		return fmt.Errorf("Agent 需要 root 或 CAP_NET_ADMIN")
 	}
-	hadNft := lookPath("nft")
-	steps := nftablesInstallPlan(lookPath)
-	if len(steps) == 0 {
-		return fmt.Errorf("未找到 apt / dnf / yum / zypper / apk / opkg / pacman，请先手动安装 nftables")
-	}
-	if steps[0].Name == "apt-get" {
-		restore := suppressServiceStart()
-		defer restore()
-	}
-	for _, step := range steps {
-		if _, err := runCmdEnv(nftInstallTimeout, step.Env, step.Name, step.Args...); err != nil {
-			return fmt.Errorf("安装或更新 nftables 失败: %v", err)
-		}
-	}
-	if !hadNft && !wasActive && !wasEnabled {
-		disableNftablesService()
-	}
 	if !lookPath("nft") {
-		return fmt.Errorf("已尝试安装 nftables，但仍找不到 nft 命令")
+		return fmt.Errorf("未找到 nft 命令，在线安装 nftables 已禁用，请通过系统包管理器手动预装 nftables")
 	}
 	return nil
 }

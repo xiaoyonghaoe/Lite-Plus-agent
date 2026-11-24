@@ -65,12 +65,13 @@ redact_agent_args() {
 
 # Default values
 service_name="lite-plus-agent"
+service_user_name="lite-agent"
 target_dir="/opt/lite-plus-agent"
 github_proxy=""
 install_version="" # New parameter for specifying version
 lite_service_name="lite-agent"
 legacy_service_name="komari-agent"
-github_repo="nuomiiiii/Lite-Plus-agent"
+github_repo="xiaoyonghaoe/Lite-Plus-agent"
 custom_layout=false
 
  
@@ -319,47 +320,7 @@ read_existing_managed_service_args() {
 }
 
 apply_remote_control_install_args() {
-    local existing=""
-    local managed=false
-    if args_have_flag "$agent_args" "enable-remote-control"; then
-        return
-    fi
-    if args_have_flag "$agent_args" "disable-web-ssh"; then
-        if bool_flag_is_true "$(flag_bool_value "$agent_args" "disable-web-ssh")"; then
-            agent_args="$(strip_remote_control_flags "$agent_args") --enable-remote-control=false"
-        else
-            agent_args="$(strip_remote_control_flags "$agent_args") --enable-remote-control=true"
-        fi
-        agent_args="${agent_args# }"
-        return
-    fi
-    if existing=$(read_existing_managed_service_args); then
-        managed=true
-    fi
-    if [ "$managed" != true ]; then
-        agent_args="${agent_args} --enable-remote-control=false"
-        agent_args="${agent_args# }"
-        return
-    fi
-    if args_have_flag "$existing" "enable-remote-control"; then
-        if bool_flag_is_true "$(flag_bool_value "$existing" "enable-remote-control")"; then
-            agent_args="${agent_args} --enable-remote-control=true"
-        else
-            agent_args="${agent_args} --enable-remote-control=false"
-        fi
-        agent_args="${agent_args# }"
-        return
-    fi
-    if args_have_flag "$existing" "disable-web-ssh"; then
-        if bool_flag_is_true "$(flag_bool_value "$existing" "disable-web-ssh")"; then
-            agent_args="${agent_args} --enable-remote-control=false"
-        else
-            agent_args="${agent_args} --enable-remote-control=true"
-        fi
-        agent_args="${agent_args# }"
-        return
-    fi
-    agent_args="${agent_args} --enable-remote-control=true"
+    agent_args="$(strip_remote_control_flags "$agent_args")"
     agent_args="${agent_args# }"
 }
 
@@ -738,6 +699,45 @@ if ! mv -f "$download_path_tmp" "$agent_path"; then
 fi
 log_success "Lite-Plus-agent installed to ${GREEN}$agent_path${NC}"
 
+ensure_agent_user() {
+    if [ "$os_name" != "linux" ]; then
+        return
+    fi
+    if ! id -u "$service_user_name" >/dev/null 2>&1; then
+        log_step "Creating dedicated system user: ${GREEN}${service_user_name}${NC}"
+        local nologin_shell="/usr/sbin/nologin"
+        if [ ! -x "$nologin_shell" ]; then
+            if [ -x "/sbin/nologin" ]; then
+                nologin_shell="/sbin/nologin"
+            else
+                nologin_shell="/bin/false"
+            fi
+        fi
+        if command -v useradd >/dev/null 2>&1; then
+            useradd --system --no-create-home --shell "$nologin_shell" "$service_user_name" || true
+        elif command -v adduser >/dev/null 2>&1; then
+            if command -v addgroup >/dev/null 2>&1; then
+                if ! getent group "$service_user_name" >/dev/null 2>&1 && ! grep -q "^${service_user_name}:" /etc/group 2>/dev/null; then
+                    addgroup -S "$service_user_name" || true
+                fi
+            fi
+            adduser -S -H -G "$service_user_name" -s "$nologin_shell" "$service_user_name" || true
+        fi
+    fi
+    if id -u "$service_user_name" >/dev/null 2>&1; then
+        for grp in adm systemd-journal; do
+            if getent group "$grp" >/dev/null 2>&1; then
+                if command -v usermod >/dev/null 2>&1; then
+                    usermod -aG "$grp" "$service_user_name" 2>/dev/null || true
+                elif command -v addgroup >/dev/null 2>&1; then
+                    addgroup "$service_user_name" "$grp" 2>/dev/null || true
+                fi
+            fi
+        done
+        chown -R "${service_user_name}:${service_user_name}" "$target_dir" 2>/dev/null || true
+    fi
+}
+
 # Detect init system and configure service
 log_step "Configuring system service..."
 
@@ -847,7 +847,11 @@ if [ "$init_system" = "nixos" ]; then
     echo -e "${CYAN}    ExecStart = \"${agent_path} ${agent_args}\";${NC}"
     echo -e "${CYAN}    WorkingDirectory = \"${target_dir}\";${NC}"
     echo -e "${CYAN}    Restart = \"always\";${NC}"
-    echo -e "${CYAN}    User = \"root\";${NC}"
+    echo -e "${CYAN}    User = \"${service_user_name}\";${NC}"
+    echo -e "${CYAN}    Group = \"${service_user_name}\";${NC}"
+    echo -e "${CYAN}    AmbientCapabilities = [ \"CAP_NET_ADMIN\" \"CAP_NET_RAW\" \"CAP_NET_BIND_SERVICE\" ];${NC}"
+    echo -e "${CYAN}    CapabilityBoundingSet = [ \"CAP_NET_ADMIN\" \"CAP_NET_RAW\" \"CAP_NET_BIND_SERVICE\" ];${NC}"
+    echo -e "${CYAN}    NoNewPrivileges = true;${NC}"
     echo -e "${CYAN}    Environment = [ \"GODEBUG=disablethp=1\" ];${NC}"
     echo -e "${CYAN}  };${NC}"
     echo -e "${CYAN}};${NC}"
@@ -887,6 +891,7 @@ EOF
 elif [ "$init_system" = "systemd" ]; then
     # Systemd service configuration
     log_info "Using systemd for service management"
+    ensure_agent_user
     service_file="/etc/systemd/system/${service_name}.service"
     cat > "$service_file" << EOF
 [Unit]
@@ -898,8 +903,13 @@ Type=simple
 ExecStart=${agent_path} ${agent_args}
 WorkingDirectory=${target_dir}
 Restart=always
-User=root
+User=${service_user_name}
+Group=${service_user_name}
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
 Environment=GODEBUG=disablethp=1
+Environment=AGENT_DATA_DIR=${target_dir}
 
 [Install]
 WantedBy=multi-user.target

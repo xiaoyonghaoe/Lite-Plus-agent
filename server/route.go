@@ -11,7 +11,6 @@ import (
 	"time"
 
 	v2 "github.com/nuomiiiii/lite-agent/protocol/v2"
-	"github.com/nuomiiiii/lite-agent/ws"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -22,7 +21,7 @@ const routeHopTimeout = 900 * time.Millisecond
 var routeProbeMu sync.Mutex
 var routeProbeImplementation = traceRouteICMP
 
-func NewRouteTask(conn *ws.SafeConn, task v2.RouteParams) {
+func NewRouteTask(task v2.RouteParams) {
 	if task.TaskID == 0 || strings.TrimSpace(task.Target) == "" {
 		return
 	}
@@ -42,7 +41,7 @@ func NewRouteTask(conn *ws.SafeConn, task v2.RouteParams) {
 		log.Printf("Return route task %d failed: %v", task.TaskID, err)
 	}
 	payload := v2.BuildRouteResultPayload(task, hops, errText, finishedAt, routeResolvedTarget(task.Target, task.IPVersion, hops), routeTargetReached(hops, task.Target, task.IPVersion))
-	reportV2Result(conn, payload, "Failed to upload return route result")
+	reportV2Result(payload, "Failed to upload return route result")
 }
 
 func runRouteProbe(target string, version, maxHops int) (hops []v2.RouteHop, err error) {

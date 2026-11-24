@@ -15,24 +15,22 @@ import (
 	"time"
 
 	"github.com/blang/semver"
-	"github.com/nuomiiiii/lite-agent/cmd/flags"
 	"github.com/nuomiiiii/lite-agent/dnsresolver"
-	"github.com/nuomiiiii/lite-agent/remotecontrol"
 	"github.com/rhysd/go-github-selfupdate/selfupdate"
 )
 
 var (
 	CurrentVersion string = "0.2.1.1"
 	// Repo is the Plus agent GitHub release channel. Do not point at Lite-agent.
-	Repo string = "nuomiiiii/Lite-Plus-agent"
+	Repo string = "xiaoyonghaoe/Lite-Plus-agent"
 )
 
 const (
-	snapshotVersionPrefix         = "Snapshot-"
-	containerMarkerPath           = "/.lite-plus-agent-container"
-	liteContainerMarkerPath       = "/.lite-agent-container"
-	legacyContainerMarkerPath     = "/.komari-agent-container"
-	releaseAssetPrefix            = "Lite-Plus-agent"
+	snapshotVersionPrefix     = "Snapshot-"
+	containerMarkerPath       = "/.lite-plus-agent-container"
+	liteContainerMarkerPath   = "/.lite-agent-container"
+	legacyContainerMarkerPath = "/.komari-agent-container"
+	releaseAssetPrefix        = "Lite-Plus-agent"
 	githubAPIBaseURL          = "https://api.github.com"
 	regularCheckInterval      = 6 * time.Hour
 	retryCheckInterval        = 15 * time.Minute
@@ -586,20 +584,12 @@ func CheckAndUpdate() error {
 	return checkAndUpdateStable(currentVersion, updater)
 }
 
-func persistRemoteControlBeforeReplace(cmdPath string) error {
-	return remotecontrol.WriteAtomic(remotecontrol.PathForExecutable(cmdPath), flags_pkg.RemoteControlEnabled())
-}
-
 var (
-	persistRemoteControlState = persistRemoteControlBeforeReplace
-	updateBinaryTo            = func(updater *selfupdate.Updater, rel *selfupdate.Release, cmdPath string) error {
+	updateBinaryTo = func(updater *selfupdate.Updater, rel *selfupdate.Release, cmdPath string) error {
 		return updater.UpdateTo(rel, cmdPath)
 	}
 )
 
 func replaceAgentBinary(updater *selfupdate.Updater, rel *selfupdate.Release, cmdPath string) error {
-	if err := persistRemoteControlState(cmdPath); err != nil {
-		return fmt.Errorf("persist remote-control state before replacing binary: %w", err)
-	}
 	return updateBinaryTo(updater, rel, cmdPath)
 }

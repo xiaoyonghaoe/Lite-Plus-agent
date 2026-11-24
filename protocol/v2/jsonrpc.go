@@ -32,6 +32,7 @@ const (
 	MethodNodemgtControlResult  = "nodemgt.controlResult"
 	MethodNodemgtUsage          = "nodemgt.usage"
 	MethodNodemgtPresence       = "nodemgt.presence"
+	MethodNodemgtStats          = "nodemgt.stats"
 	MethodAgentFirewallSnapshot = "agent.firewall.snapshot"
 	MethodAgentFirewallApply    = "agent.firewall.apply"
 	MethodAgentFirewallAdopt    = "agent.firewall.adopt"
@@ -76,8 +77,10 @@ type Event struct {
 }
 
 type EventResult struct {
-	Status string  `json:"status,omitempty"`
-	Events []Event `json:"events,omitempty"`
+	Status         string  `json:"status,omitempty"`
+	Events         []Event `json:"events,omitempty"`
+	NextIntervalMS int64   `json:"next_interval_ms,omitempty"`
+	HasMore        bool    `json:"has_more,omitempty"`
 }
 
 type ConfigParams struct {

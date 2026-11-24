@@ -7,8 +7,6 @@ import (
 	"path/filepath"
 	"testing"
 	"unicode/utf16"
-
-	"github.com/nuomiiiii/lite-agent/remotecontrol"
 )
 
 type fakeController struct {
@@ -40,7 +38,7 @@ func (f *fakeController) LegacyServiceExists(name string) bool {
 	}
 	return f.legacy && name == komariServiceName
 }
-func (f *fakeController) Collect(string) (spec, error)    { return f.collect, nil }
+func (f *fakeController) Collect(string) (spec, error) { return f.collect, nil }
 func (f *fakeController) Install(next spec) error {
 	f.installed = &next
 	return nil
@@ -280,10 +278,6 @@ func TestUpgradeFrom2203PreservesDataThenNewProcessUninstallsOld(t *testing.T) {
 	mustSame("net_static.json.bak", backup)
 	mustSame("node.json", nodeCfg)
 	mustSame("agent.env", envFile)
-	enabled, ok, err := remotecontrol.Read(filepath.Join(newDir, remotecontrol.StateFileName))
-	if err != nil || !ok || !enabled {
-		t.Fatalf("relocated remote-control.state enabled=%t ok=%t err=%v", enabled, ok, err)
-	}
 
 	copied, err := os.ReadFile(filepath.Join(newDir, "Lite-Plus-agent"))
 	if err != nil {
@@ -310,34 +304,6 @@ func TestUpgradeFrom2203PreservesDataThenNewProcessUninstallsOld(t *testing.T) {
 	}
 	if newProc.running["komari-agent"] {
 		t.Fatal("legacy service still marked running")
-	}
-}
-
-func TestSeedRemoteControlStateFromLegacyFlags(t *testing.T) {
-	dir := t.TempDir()
-	if err := seedRemoteControlState(dir, []string{"-e", "example.com", "--disable-web-ssh=true"}); err != nil {
-		t.Fatal(err)
-	}
-	enabled, ok, err := remotecontrol.Read(filepath.Join(dir, remotecontrol.StateFileName))
-	if err != nil || !ok || enabled {
-		t.Fatalf("disable-web-ssh must seed remote off enabled=%t ok=%t err=%v", enabled, ok, err)
-	}
-
-	dir = t.TempDir()
-	if err := seedRemoteControlState(dir, []string{"-e", "example.com", "-t", "token"}); err != nil {
-		t.Fatal(err)
-	}
-	enabled, ok, err = remotecontrol.Read(filepath.Join(dir, remotecontrol.StateFileName))
-	if err != nil || !ok || !enabled {
-		t.Fatalf("legacy -e -t must seed remote on enabled=%t ok=%t err=%v", enabled, ok, err)
-	}
-
-	dir = t.TempDir()
-	if err := seedRemoteControlState(dir, []string{"--enable-remote-control=false"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(dir, remotecontrol.StateFileName)); !os.IsNotExist(err) {
-		t.Fatal("explicit new remote flag must not invent a state file")
 	}
 }
 

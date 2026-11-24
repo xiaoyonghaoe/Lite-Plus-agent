@@ -831,6 +831,7 @@ func (p *policyEngine) knownUserID(name string) string {
 	if name == "" {
 		return ""
 	}
+	baseName, vtag := SplitVirtualUserKey(name)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if spec, ok := p.byLogin[name]; ok {
@@ -840,14 +841,25 @@ func (p *policyEngine) knownUserID(name string) string {
 		return spec.ID
 	}
 	for _, u := range p.users {
-		if u.ID == name {
+		if u.ID == name || (vtag != "" && u.ID == baseName) {
 			return u.ID
+		}
+	}
+	if vtag != "" {
+		if spec, ok := p.byLogin[baseName]; ok {
+			return spec.ID
+		}
+		if spec, ok := p.byUUID[strings.ToLower(baseName)]; ok {
+			return spec.ID
 		}
 	}
 	return ""
 }
 
 func identityFront(in InboundSpec, users []UserSpec) bool {
+	if len(inboundVirtualTags(in)) > 0 {
+		return false
+	}
 	p := strings.ToLower(strings.TrimSpace(in.Protocol))
 	if p == "" || p == "socks" || p == "http" {
 		return true

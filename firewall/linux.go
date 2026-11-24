@@ -127,7 +127,7 @@ func (b linuxBackend) snapshot() v2.FirewallResultParams {
 		DefaultDenyBlocked: defaultDenyBlocked(b.kind, outer),
 		KeepRules:          keepRules(v2.FirewallIntent{}),
 		SshPort:            detectedSSHPort(),
-		CanInstallNftables: canInstallNftables(),
+		CanInstallNftables: false,
 	}
 	if result.DefaultDenyBlocked {
 		result.DefaultDenyBlockReason = "default deny conflicts with ufw or firewalld"
@@ -682,21 +682,17 @@ func addFirewalldPermanent(rule v2.FirewallHostRule) error {
 	return nil
 }
 
-func applyPing(v4, v6 bool) error {
-	if stackAllowed(v2.FirewallStackV4) {
-		if err := writeSysctl("/proc/sys/net/ipv4/icmp_echo_ignore_all", bool01(v4)); err != nil {
-			return err
-		}
-	}
-	if stackAllowed(v2.FirewallStackV6) {
-		if err := writeSysctl("/proc/sys/net/ipv6/icmp/echo_ignore_all", bool01(v6)); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-	}
+// applyPing is a no-op because ICMP echo blocking is enforced directly via
+// firewall rules (nftables / iptables) so non-root agents with CAP_NET_ADMIN
+// never need write access to /proc/sys.
+func applyPing(_, _ bool) error {
 	return nil
 }
 
 func pingBlocked(family int) bool {
+	if pingBlockedByFirewall(family) {
+		return true
+	}
 	path := "/proc/sys/net/ipv4/icmp_echo_ignore_all"
 	if family == 6 {
 		path = "/proc/sys/net/ipv6/icmp/echo_ignore_all"
@@ -708,15 +704,32 @@ func pingBlocked(family int) bool {
 	return strings.TrimSpace(string(raw)) == "1"
 }
 
-func bool01(v bool) string {
-	if v {
-		return "1"
+func pingBlockedByFirewall(family int) bool {
+	if lookPath("nft") {
+		if out, err := runCmd(cmdTimeout, "nft", "list", "table", "inet", nftTable); err == nil {
+			if family == 6 && strings.Contains(out, "icmpv6 type echo-request drop") {
+				return true
+			}
+			if family != 6 && strings.Contains(out, "icmp type echo-request drop") {
+				return true
+			}
+		}
 	}
-	return "0"
-}
-
-func writeSysctl(path, value string) error {
-	return os.WriteFile(path, []byte(value+"\n"), 0o644)
+	bin := "iptables"
+	needle := "echo-request"
+	if family == 6 {
+		bin = "ip6tables"
+	}
+	if lookPath(bin) {
+		if out, err := runCmd(cmdTimeout, bin, "-S", iptablesChain); err == nil {
+			for _, line := range strings.Split(out, "\n") {
+				if strings.Contains(line, needle) && strings.Contains(line, "DROP") {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func applyNFT(intent v2.FirewallIntent, holes []v2.FirewallHole) error {

@@ -39,12 +39,6 @@ func Snapshot() v2.FirewallResultParams {
 	return withStacks(currentBackend().snapshot())
 }
 
-func InstallNftables() v2.FirewallResultParams {
-	opMu.Lock()
-	defer opMu.Unlock()
-	return withStacks(installNftables())
-}
-
 func Apply(intent v2.FirewallIntent, holes []v2.FirewallHole) v2.FirewallResultParams {
 	opMu.Lock()
 	defer opMu.Unlock()
@@ -73,42 +67,20 @@ func Apply(intent v2.FirewallIntent, holes []v2.FirewallHole) v2.FirewallResultP
 	holes = liveHoles(intent, holes)
 	prev, _ := eng.dump()
 	ping4, ping6 := captureAux()
-	needSSH := keepPort(intent.SshPort) != ""
-	var sshSnap []sshFileSnap
-	if needSSH {
-		sshSnap = snapshotSSHConfigs()
-	}
+	intent.SshPort = ""
 	if err := eng.apply(intent, holes); err != nil {
 		rollbackApply(prev, ping4, ping6)
 		result.Status = v2.FirewallStatusError
 		result.Error = err.Error()
 		return result
 	}
-	if needSSH {
-		if err := syncSSHListenPort(intent.SshPort); err != nil {
-			restoreSSHConfigs(sshSnap)
-			rollbackApply(prev, ping4, ping6)
-			result.Status = v2.FirewallStatusError
-			result.Error = err.Error()
-			return result
-		}
-	}
 	if !watchdogOK() {
-		if needSSH {
-			restoreSSHConfigs(sshSnap)
-		}
 		rollbackApply(prev, ping4, ping6)
 		result.Status = v2.FirewallStatusRolledBack
 		result.Error = "agent lost the control plane after apply; previous rules restored"
 		return result
 	}
-	if port := sshPortOf(intent); port != "" {
-		intent.SshPort = port
-	}
 	if err := persistApplied(intent, holes, eng.name()); err != nil {
-		if needSSH {
-			restoreSSHConfigs(sshSnap)
-		}
 		rollbackApply(prev, ping4, ping6)
 		result.Status = v2.FirewallStatusError
 		result.Error = err.Error()

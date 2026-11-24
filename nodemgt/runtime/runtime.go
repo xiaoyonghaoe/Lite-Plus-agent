@@ -192,10 +192,12 @@ func (r *Runtime) SetSender(fn func(method string, params any) error) {
 func (r *Runtime) loop(ctx context.Context) {
 	expireTick := time.NewTicker(time.Second)
 	usageTick := time.NewTicker(15 * time.Second)
+	statsTick := time.NewTicker(60 * time.Second)
 	certTick := time.NewTicker(time.Minute)
 	geoTick := time.NewTicker(12 * time.Hour)
 	defer expireTick.Stop()
 	defer usageTick.Stop()
+	defer statsTick.Stop()
 	defer certTick.Stop()
 	defer geoTick.Stop()
 	for {
@@ -206,6 +208,8 @@ func (r *Runtime) loop(ctx context.Context) {
 			r.expireUsers()
 		case <-usageTick.C:
 			r.FlushUsage()
+		case <-statsTick.C:
+			r.FlushStats()
 		case <-certTick.C:
 			r.reloadRenewedFileCerts()
 		case <-geoTick.C:
@@ -501,7 +505,8 @@ func (r *Runtime) applySnapshotModeWithOpLocked(payload json.RawMessage, mode sn
 			CertPath string `json:"cert_path"`
 			KeyPath  string `json:"key_path"`
 		} `json:"certs"`
-		DialStack string `json:"dial_stack"`
+		DialStack    string `json:"dial_stack"`
+		StatsEnabled bool   `json:"stats_enabled"`
 	}
 	if err := json.Unmarshal(payload, &snap); err != nil {
 		return err
@@ -664,6 +669,11 @@ func (r *Runtime) applySnapshotModeWithOpLocked(payload json.RawMessage, mode sn
 			SetDialStack(string)
 		}); ok {
 			setter.SetDialStack(snap.DialStack)
+		}
+		if setter, ok := core.(interface {
+			SetStatsEnabled(bool)
+		}); ok {
+			setter.SetStatsEnabled(snap.StatsEnabled)
 		}
 		if stager, ok := core.(interface {
 			StageUsers([]coreadapter.UserSpec)
@@ -1359,4 +1369,48 @@ func atomicWrite(path string, data []byte) error {
 		return err
 	}
 	return os.Rename(tmpName, path)
+}
+
+
+// FlushStats drains per-inbound and Top-15 domain traffic stats from cores
+// that support multi-dimensional stats and reports them to Master.
+func (r *Runtime) FlushStats() {
+	if r == nil {
+		return
+	}
+	var merged coreadapter.StatsBatch
+	for _, core := range r.cores {
+		drainer, ok := core.(interface {
+			DrainStats(topN int) coreadapter.StatsBatch
+		})
+		if !ok {
+			continue
+		}
+		part := drainer.DrainStats(15)
+		if len(part.InboundUsage) > 0 {
+			merged.InboundUsage = append(merged.InboundUsage, part.InboundUsage...)
+		}
+		if len(part.DomainTop) > 0 {
+			merged.DomainTop = append(merged.DomainTop, part.DomainTop...)
+		}
+	}
+	if merged.Empty() {
+		return
+	}
+	r.mu.Lock()
+	send := r.sender
+	result := r.result
+	if send == nil && result != nil {
+		send = func(method string, params any) error {
+			result(method, params)
+			return nil
+		}
+	}
+	r.mu.Unlock()
+	if send == nil {
+		return
+	}
+	if err := send(v2.MethodNodemgtStats, merged); err != nil {
+		log.Printf("nodemgt stats send: %v", err)
+	}
 }

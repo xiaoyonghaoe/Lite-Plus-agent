@@ -318,7 +318,10 @@ func (c *xrayCore) tryDynamicUserSyncLocked(nextUsers []UserSpec) bool {
 		if len(c.lastInboundTags[specKey]) == 0 {
 			return false
 		}
-		for _, u := range usersForInbound(nextLive, in.ID) {
+		if len(inboundVirtualTags(in)) > 0 {
+			return false
+		}
+		for _, u := range userEntriesForInbound(nextLive, in) {
 			if _, _, ok := xrayMemoryUser(in, u); !ok {
 				return false
 			}
@@ -329,8 +332,8 @@ func (c *xrayCore) tryDynamicUserSyncLocked(nextUsers []UserSpec) bool {
 			continue
 		}
 		specKey := inboundSpecKey(in)
-		prevGranted := usersForInbound(prevLive, in.ID)
-		nextGranted := usersForInbound(nextLive, in.ID)
+		prevGranted := userEntriesForInbound(prevLive, in)
+		nextGranted := userEntriesForInbound(nextLive, in)
 		if !syncXrayInboundUsers(c.inst, c.lastInboundTags[specKey], in, prevGranted, nextGranted) {
 			return false
 		}
@@ -461,7 +464,7 @@ func (c *xrayCore) buildConfig(users []UserSpec, inbounds []InboundSpec, outboun
 		if proto == "" {
 			proto = "socks"
 		}
-		granted := usersForInbound(users, in.ID)
+		granted := userEntriesForInbound(users, in)
 		accounts := make([]map[string]string, 0, len(granted)+1)
 		clients := make([]map[string]string, 0, len(granted)+1)
 		allowsFlow := proto == "vless" && inboundAllowsVLESSFlow(in)
@@ -481,7 +484,7 @@ func (c *xrayCore) buildConfig(users []UserSpec, inbounds []InboundSpec, outboun
 				liveClients = applyClientFlow(clients, flow)
 			}
 		}
-		public := coreOwnedTLS(in, users) || udpInbound(proto)
+		public := coreOwnedTLS(in, users) || udpInbound(proto) || len(inboundVirtualTags(in)) > 0
 		isIdentity := !public && identityFront(in, users)
 		var loopUser, loopPass, loopUUID string
 		if isIdentity {
@@ -655,7 +658,7 @@ func (c *xrayCore) buildConfig(users []UserSpec, inbounds []InboundSpec, outboun
 		}
 	}
 	obs := xrayOutbounds(outbounds)
-	rules := xrayRouteRules(routes, outbounds, listenTags)
+	rules := xrayRouteRules(routes, outbounds, inbounds, users, listenTags)
 	if len(policyTags) > 0 {
 		var extra []frontSpec
 		var coreIn []map[string]any
@@ -1155,7 +1158,7 @@ func outboundStream(transport, security, sni, fingerprint, wsPath, wsHost, grpcS
 	return stream
 }
 
-func xrayRouteRules(routes []RouteSpec, outbounds []OutboundSpec, inboundTags map[string][]string) []map[string]any {
+func xrayRouteRules(routes []RouteSpec, outbounds []OutboundSpec, inbounds []InboundSpec, users []UserSpec, inboundTags map[string][]string) []map[string]any {
 	byID := map[string]string{}
 	for _, row := range outbounds {
 		if row.ID != "" && row.Name != "" {
@@ -1200,8 +1203,15 @@ func xrayRouteRules(routes []RouteSpec, outbounds []OutboundSpec, inboundTags ma
 		} else {
 			rule["outboundTag"] = tag
 		}
-		if tags := inboundAliasTags(s.InboundID, inboundTags); len(tags) > 0 {
+		baseInbID, _ := SplitVirtualInboundID(s.InboundID)
+		if tags := inboundAliasTags(baseInbID, inboundTags); len(tags) > 0 {
 			rule["inboundTag"] = tags
+		}
+		if authUsers, restrict := routeAuthUsersForInbound(s.InboundID, inbounds, users); restrict {
+			if len(authUsers) == 0 {
+				continue
+			}
+			rule["user"] = authUsers
 		}
 		if domains := splitCSV(s.Domain); len(domains) > 0 {
 			rule["domain"] = domains

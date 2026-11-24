@@ -36,6 +36,15 @@ type singBoxCore struct {
 	lastDialStack string
 	fronts        []*spliceFront
 	policy        *policyEngine
+	stats         *statsCollector
+}
+
+func (c *singBoxCore) SetStatsEnabled(on bool) {
+	c.stats.SetEnabled(on)
+}
+
+func (c *singBoxCore) DrainStats(topN int) StatsBatch {
+	return c.stats.Drain(topN)
 }
 
 func (c *singBoxCore) SetForwarding(outbounds []OutboundSpec, routes []RouteSpec) {
@@ -53,7 +62,11 @@ func (c *singBoxCore) SetDialStack(stack string) {
 }
 
 func newSingBoxCore() *singBoxCore {
-	return &singBoxCore{denied: map[string]struct{}{}, policy: newPolicyEngineWithRole("sing-box")}
+	return &singBoxCore{
+		denied: map[string]struct{}{},
+		policy: newPolicyEngineWithRole("sing-box"),
+		stats:  newStatsCollector(),
+	}
 }
 
 func (c *singBoxCore) Name() string    { return "sing-box" }
@@ -214,7 +227,7 @@ func (c *singBoxCore) tryDynamicUserSyncLocked(nextUsers []UserSpec) bool {
 		if !nowActive || identityFront(in, nextLive) {
 			continue
 		}
-		if !singBoxInboundUsersCoveredByBuilt(in, usersForInbound(nextLive, in.ID), c.builtUsers) {
+		if !singBoxInboundUsersCoveredByBuilt(in, userEntriesForInbound(nextLive, in), c.builtUsers) {
 			return false
 		}
 	}
@@ -265,7 +278,7 @@ func (c *singBoxCore) restartLocked() error {
 	c.builtUsers = append([]UserSpec(nil), live...)
 	c.policy.sync(live, c.denied)
 	c.policy.setDialStack(c.dialStack)
-	attachSingBoxTrackers(c.inst, c.policy)
+	attachSingBoxTrackers(c.inst, c.policy, c.stats)
 	started, err := startPolicyFronts(c.policy, fronts)
 	if err != nil {
 		_ = c.stopLocked()
@@ -309,7 +322,7 @@ func (c *singBoxCore) restoreLastGood() {
 	c.builtUsers = append([]UserSpec(nil), live...)
 	c.policy.sync(live, c.denied)
 	c.policy.setDialStack(c.dialStack)
-	attachSingBoxTrackers(c.inst, c.policy)
+	attachSingBoxTrackers(c.inst, c.policy, c.stats)
 	started, ferr := startPolicyFronts(c.policy, fronts)
 	if ferr == nil {
 		c.fronts = started
@@ -317,12 +330,15 @@ func (c *singBoxCore) restoreLastGood() {
 	c.inbounds = append([]InboundSpec(nil), c.lastIn...)
 }
 
-func attachSingBoxTrackers(inst *box.Box, policy *policyEngine) {
+func attachSingBoxTrackers(inst *box.Box, policy *policyEngine, stats *statsCollector) {
 	if inst == nil || policy == nil {
 		return
 	}
 	inst.Router().AppendTracker(newIPLimitTracker(policy))
 	inst.Router().AppendTracker(newQuotaTracker(policy))
+	if stats != nil {
+		inst.Router().AppendTracker(newStatsTracker(policy, stats))
+	}
 }
 
 func startSingBox(raw []byte) (*box.Box, context.CancelFunc, error) {
@@ -358,6 +374,7 @@ func (c *singBoxCore) buildConfig(users []UserSpec, inbounds []InboundSpec, outb
 	var meterTags []string
 	var loopUsers []string
 	listenTags := map[string][]string{}
+	tagToInbound := map[string]string{}
 	for i, in := range inbounds {
 		tag := in.ID
 		if tag == "" {
@@ -372,7 +389,7 @@ func (c *singBoxCore) buildConfig(users []UserSpec, inbounds []InboundSpec, outb
 		default:
 			continue
 		}
-		granted := usersForInbound(users, in.ID)
+		granted := userEntriesForInbound(users, in)
 		hosts := FrontListenHosts(inboundStack(in), in.Listen)
 		if len(hosts) == 0 {
 			continue
@@ -565,6 +582,7 @@ func (c *singBoxCore) buildConfig(users []UserSpec, inbounds []InboundSpec, outb
 			items = append(items, cloned)
 			if in.ID != "" {
 				listenTags[in.ID] = append(listenTags[in.ID], useTag)
+				tagToInbound[useTag] = in.ID
 			}
 			if identityFront(in, users) {
 				skipIP = append(skipIP, useTag)
@@ -585,7 +603,7 @@ func (c *singBoxCore) buildConfig(users []UserSpec, inbounds []InboundSpec, outb
 		}
 	}
 	obs := singBoxOutbounds(outbounds)
-	rules := append(singBoxSniffRules(inbounds, listenTags), singBoxRouteRules(routes, outbounds, listenTags)...)
+	rules := append(singBoxSniffRules(inbounds, listenTags), singBoxRouteRules(routes, outbounds, inbounds, users, listenTags)...)
 	if len(policyTags) > 0 {
 		var extra []frontSpec
 		var coreIn []map[string]any
@@ -606,6 +624,7 @@ func (c *singBoxCore) buildConfig(users []UserSpec, inbounds []InboundSpec, outb
 	c.policy.setLoopUsers(loopUsers)
 	c.policy.setSkipCoreIP(skipIP)
 	c.policy.setMeterCore(meterTags)
+	c.stats.setTagMap(tagToInbound)
 	cfg := map[string]any{
 		"log":       map[string]any{"level": "error", "timestamp": false},
 		"inbounds":  items,
@@ -895,7 +914,7 @@ func singBoxProxyOutbound(row OutboundSpec, tag string, tags map[string]string) 
 	return item
 }
 
-func singBoxRouteRules(routes []RouteSpec, outbounds []OutboundSpec, inboundTags map[string][]string) []map[string]any {
+func singBoxRouteRules(routes []RouteSpec, outbounds []OutboundSpec, inbounds []InboundSpec, users []UserSpec, inboundTags map[string][]string) []map[string]any {
 	tags := outboundTagIndex(outbounds)
 	sorted := append([]RouteSpec(nil), routes...)
 	for i := 0; i < len(sorted); i++ {
@@ -946,8 +965,15 @@ func singBoxRouteRules(routes []RouteSpec, outbounds []OutboundSpec, inboundTags
 		if sources := splitCSV(rule.Source); len(sources) > 0 {
 			item["source_ip_cidr"] = sources
 		}
-		if tags := inboundAliasTags(rule.InboundID, inboundTags); len(tags) > 0 {
+		baseInbID, _ := SplitVirtualInboundID(rule.InboundID)
+		if tags := inboundAliasTags(baseInbID, inboundTags); len(tags) > 0 {
 			item["inbound"] = tags
+		}
+		if authUsers, restrict := routeAuthUsersForInbound(rule.InboundID, inbounds, users); restrict {
+			if len(authUsers) == 0 {
+				continue
+			}
+			item["auth_user"] = authUsers
 		}
 		rules = append(rules, mergeSingBoxGeo(item, parseGeoMatch(splitCSV(rule.Domain), splitCSV(rule.IP))))
 	}

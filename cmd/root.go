@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -21,10 +20,8 @@ import (
 	monitoring "github.com/nuomiiiii/lite-agent/monitoring/unit"
 	nodemgtruntime "github.com/nuomiiiii/lite-agent/nodemgt/runtime"
 	"github.com/nuomiiiii/lite-agent/relocate"
-	"github.com/nuomiiiii/lite-agent/remotecontrol"
 	"github.com/nuomiiiii/lite-agent/runtimeconfig"
 	"github.com/nuomiiiii/lite-agent/server"
-	"github.com/nuomiiiii/lite-agent/tasklog"
 	"github.com/nuomiiiii/lite-agent/update"
 	"github.com/nuomiiiii/lite-agent/utils"
 	"github.com/spf13/cobra"
@@ -59,11 +56,6 @@ var RootCmd = &cobra.Command{
 			log.Println("layout relocation handed off to Lite-Plus-agent")
 			os.Exit(0)
 		}
-		if taskLog, err := tasklog.Open(tasklog.PathForConfig(flags.ConfigFile)); err != nil {
-			return fmt.Errorf("open task log: %w", err)
-		} else {
-			server.SetTaskLog(taskLog)
-		}
 		runtimeconfig.Initialize(runtimeconfig.State{
 			MonthRotate:         flags.MonthRotate,
 			MonthRotateTime:     flags.MonthRotateTime,
@@ -78,12 +70,9 @@ var RootCmd = &cobra.Command{
 		// 捕获中止信号，优雅退出
 		stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		recoverCtx, stopRecover := context.WithCancel(context.Background())
-		defer stopRecover()
 		go func() {
 			<-stopCtx.Done()
 			log.Printf("shutting down gracefully...")
-			stopRecover()
 			netstatic.Stop()
 			os.Exit(0)
 		}()
@@ -119,7 +108,6 @@ var RootCmd = &cobra.Command{
 			log.Printf("Using system default DNS resolver")
 		}
 
-		server.StartTaskRecovery(recoverCtx)
 		nodemgtruntime.SetLiveInboundsHook(setProxyMemoryMode)
 		server.StartNodemgtRuntime(flags.ConfigFile)
 		diskList, err := monitoring.DiskList()
@@ -150,10 +138,9 @@ var RootCmd = &cobra.Command{
 		}
 		go server.DoUploadBasicInfoWorks()
 		go server.DoRuntimeConfigStateUploadWorks()
-		for {
-			server.UpdateBasicInfo()
-			server.EstablishWebSocketConnection()
-		}
+		server.UpdateBasicInfo()
+		server.RunHTTPReporter(stopCtx)
+		return nil
 	},
 }
 
@@ -196,112 +183,6 @@ func loadEffectiveConfig(cmd *cobra.Command, config *pkg_flags.Config) error {
 			return fmt.Errorf("failed to restore command line flag --%s: %w", flag.name, err)
 		}
 	}
-	return applyRemoteControlConfig(cmd, config, fileBytes, configPath)
-}
-
-func persistMigratedRemoteControl(configPath string, enabled bool) error {
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return err
-	}
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
-	}
-	enabledJSON, err := json.Marshal(enabled)
-	if err != nil {
-		return err
-	}
-	raw["remote_control_enabled"] = enabledJSON
-	delete(raw, "disable_web_ssh")
-	out, err := json.MarshalIndent(raw, "", "  ")
-	if err != nil {
-		return err
-	}
-	return remotecontrol.WriteFileAtomic(configPath, append(out, '\n'), 0o600)
-}
-
-var persistMigratedRemoteControlFn func(string, bool) error = persistMigratedRemoteControl
-var looksLikePriorHostInstall = relocate.LooksLikePriorHostInstall
-
-func defaultRemoteControlStatePath() string {
-	exe, err := os.Executable()
-	if err != nil {
-		return ""
-	}
-	resolved, err := filepath.EvalSymlinks(exe)
-	if err == nil {
-		exe = resolved
-	}
-	return remotecontrol.PathForExecutable(exe)
-}
-
-var remoteControlStatePath = defaultRemoteControlStatePath
-
-func envValuePresent(key string) bool {
-	return strings.TrimSpace(os.Getenv(key)) != ""
-}
-
-func flagChanged(cmd *cobra.Command, name string) bool {
-	flag := cmd.Flags().Lookup(name)
-	return flag != nil && flag.Changed
-}
-
-func jsonHasKey(fileBytes []byte, key string) bool {
-	if len(fileBytes) == 0 {
-		return false
-	}
-	var raw map[string]json.RawMessage
-	if json.Unmarshal(fileBytes, &raw) != nil {
-		return false
-	}
-	_, ok := raw[key]
-	return ok
-}
-
-func applyRemoteControlConfig(cmd *cobra.Command, config *pkg_flags.Config, fileBytes []byte, configPath string) error {
-	enableFlagSet := flagChanged(cmd, "enable-remote-control")
-	disableFlagSet := flagChanged(cmd, "disable-web-ssh")
-	enablePresent := enableFlagSet || envValuePresent("AGENT_REMOTE_CONTROL_ENABLED") || jsonHasKey(fileBytes, "remote_control_enabled")
-	disablePresent := disableFlagSet || envValuePresent("AGENT_DISABLE_WEB_SSH") || jsonHasKey(fileBytes, "disable_web_ssh")
-	if enablePresent {
-		if configPath != "" && jsonHasKey(fileBytes, "disable_web_ssh") {
-			if err := persistMigratedRemoteControlFn(configPath, config.RemoteControlEnabled); err != nil {
-				return fmt.Errorf("persist remote_control_enabled: %w", err)
-			}
-		}
-		return nil
-	}
-	if disablePresent {
-		config.RemoteControlEnabled = !config.DisableWebSsh
-		if configPath != "" && jsonHasKey(fileBytes, "disable_web_ssh") {
-			if err := persistMigratedRemoteControlFn(configPath, config.RemoteControlEnabled); err != nil {
-				return fmt.Errorf("persist remote_control_enabled: %w", err)
-			}
-		}
-		return nil
-	}
-	statePath := remoteControlStatePath()
-	if statePath != "" {
-		enabled, ok, err := remotecontrol.Read(statePath)
-		if err != nil {
-			return fmt.Errorf("read remote-control state: %w", err)
-		}
-		if ok {
-			config.RemoteControlEnabled = enabled
-			return nil
-		}
-	}
-	if looksLikePriorHostInstall() {
-		config.RemoteControlEnabled = true
-		if statePath != "" {
-			if err := remotecontrol.WriteAtomic(statePath, true); err != nil {
-				log.Printf("failed to persist remote-control state for prior host install: %v", err)
-			}
-		}
-		return nil
-	}
-	config.RemoteControlEnabled = false
 	return nil
 }
 
@@ -373,10 +254,6 @@ func init() {
 	_ = RootCmd.PersistentFlags().MarkHidden("auto-discovery")
 	_ = RootCmd.PersistentFlags().MarkDeprecated("auto-discovery", "registration is no longer available; existing installs read auto-discovery.json")
 	RootCmd.PersistentFlags().BoolVar(&flags.DisableAutoUpdate, "disable-auto-update", false, "Disable automatic updates")
-	RootCmd.PersistentFlags().BoolVar(&flags.RemoteControlEnabled, "enable-remote-control", false, "Enable remote control (terminal, files, exec, and MCP)")
-	RootCmd.PersistentFlags().BoolVar(&flags.DisableWebSsh, "disable-web-ssh", false, "Deprecated; use --enable-remote-control")
-	_ = RootCmd.PersistentFlags().MarkHidden("disable-web-ssh")
-	_ = RootCmd.PersistentFlags().MarkDeprecated("disable-web-ssh", "use --enable-remote-control instead")
 	//RootCmd.PersistentFlags().BoolVar(&flags.MemoryModeAvailable, "memory-mode-available", false, "[deprecated]Report memory as available instead of used.")
 	RootCmd.PersistentFlags().Float64VarP(&flags.Interval, "interval", "i", 3.0, "Interval in seconds")
 	RootCmd.PersistentFlags().BoolVarP(&flags.IgnoreUnsafeCert, "ignore-unsafe-cert", "u", false, "Ignore unsafe certificate errors")
