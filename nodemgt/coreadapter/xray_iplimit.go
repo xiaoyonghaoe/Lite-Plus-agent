@@ -37,6 +37,7 @@ import (
 type ipLimitDispatcher struct {
 	routing.Dispatcher
 	policy *policyEngine
+	stats  *statsCollector
 }
 
 type xrayLinkSession struct {
@@ -116,7 +117,7 @@ func (d *ipLimitDispatcher) Dispatch(ctx context.Context, dest xnet.Destination)
 		return nil, fmt.Errorf("user denied")
 	}
 	inLink, outLink := newDispatcherLinks(ctx)
-	ls := d.trackAndMeterLinks(ctx, inLink, outLink)
+	ls := d.trackAndMeterLinks(ctx, dest, inLink, outLink)
 	go func() {
 		if err := d.Dispatcher.DispatchLink(ctx, dest, outLink); err != nil {
 			common.Close(inLink.Writer)
@@ -142,7 +143,7 @@ func (d *ipLimitDispatcher) DispatchLink(ctx context.Context, dest xnet.Destinat
 		}
 		return fmt.Errorf("user denied")
 	}
-	ls := d.trackAndMeterLink(ctx, link)
+	ls := d.trackAndMeterLink(ctx, dest, link)
 	if err := d.Dispatcher.DispatchLink(ctx, dest, link); err != nil {
 		if ls != nil {
 			_ = ls.Close()
@@ -193,7 +194,37 @@ func (d *ipLimitDispatcher) resolveSessionUser(ctx context.Context) (userID stri
 	return userID, meter, conn
 }
 
-func (d *ipLimitDispatcher) trackAndMeterLink(ctx context.Context, link *transport.Link) *xrayLinkSession {
+func (d *ipLimitDispatcher) xrayStatsCallbacks(ctx context.Context, dest xnet.Destination, userID string) (upFn, downFn func(int64)) {
+	if d.stats == nil || !d.stats.Enabled() || userID == "" {
+		return nil, nil
+	}
+	in := session.InboundFromContext(ctx)
+	if in == nil {
+		return nil, nil
+	}
+	baseInb := d.stats.resolveBaseInbound(in.Tag)
+	if baseInb == "" {
+		return nil, nil
+	}
+	vtag := ""
+	if in.User != nil {
+		_, vtag = SplitVirtualUserKey(in.User.Email)
+	}
+	effInb := FormatVirtualInboundID(baseInb, vtag)
+	domain := ""
+	if dest.Address != nil && dest.Address.Family().IsDomain() {
+		domain = normalizeRootDomain(dest.Address.Domain())
+	}
+	upFn = func(n int64) {
+		d.stats.record(effInb, userID, domain, n, 0)
+	}
+	downFn = func(n int64) {
+		d.stats.record(effInb, userID, domain, 0, n)
+	}
+	return upFn, downFn
+}
+
+func (d *ipLimitDispatcher) trackAndMeterLink(ctx context.Context, dest xnet.Destination, link *transport.Link) *xrayLinkSession {
 	userID, meter, conn := d.resolveSessionUser(ctx)
 	if userID == "" || link == nil {
 		return nil
@@ -222,12 +253,13 @@ func (d *ipLimitDispatcher) trackAndMeterLink(ctx context.Context, link *transpo
 		context.AfterFunc(ctx, ls.finish)
 	}
 	if meter {
-		link.Reader, link.Writer = wrapQuotaIOSession(d.policy, userID, link.Reader, link.Writer, ls)
+		upFn, downFn := d.xrayStatsCallbacks(ctx, dest, userID)
+		link.Reader, link.Writer = wrapQuotaIOSessionWithStats(d.policy, userID, link.Reader, link.Writer, ls, upFn, downFn)
 	}
 	return ls
 }
 
-func (d *ipLimitDispatcher) trackAndMeterLinks(ctx context.Context, inLink, outLink *transport.Link) *xrayLinkSession {
+func (d *ipLimitDispatcher) trackAndMeterLinks(ctx context.Context, dest xnet.Destination, inLink, outLink *transport.Link) *xrayLinkSession {
 	userID, meter, conn := d.resolveSessionUser(ctx)
 	if userID == "" {
 		return nil
@@ -262,11 +294,12 @@ func (d *ipLimitDispatcher) trackAndMeterLinks(ctx context.Context, inLink, outL
 		context.AfterFunc(ctx, ls.finish)
 	}
 	if meter {
+		upFn, downFn := d.xrayStatsCallbacks(ctx, dest, userID)
 		if inLink != nil {
-			_, inLink.Writer = wrapQuotaIOSession(d.policy, userID, nil, inLink.Writer, ls)
+			_, inLink.Writer = wrapQuotaIOSessionWithStats(d.policy, userID, nil, inLink.Writer, ls, nil, upFn)
 		}
 		if outLink != nil {
-			_, outLink.Writer = wrapQuotaIOSession(d.policy, userID, nil, outLink.Writer, ls)
+			_, outLink.Writer = wrapQuotaIOSessionWithStats(d.policy, userID, nil, outLink.Writer, ls, nil, downFn)
 		}
 	}
 	return ls
@@ -285,6 +318,7 @@ type quotaReader struct {
 	policy   *policyEngine
 	stop     <-chan struct{}
 	ls       *xrayLinkSession
+	onBytes  func(int64)
 	doneOnce sync.Once
 }
 
@@ -316,10 +350,15 @@ func (r *quotaReader) Interrupt() {
 }
 
 func (r *quotaReader) account(mb buf.MultiBuffer, err error) (buf.MultiBuffer, error) {
-	if n := int(mb.Len()); n > 0 && !r.policy.accountLinkBytesContext(r.userID, n, r.stop) {
-		buf.ReleaseMulti(mb)
-		r.markDone()
-		return nil, fmt.Errorf("quota exceeded")
+	if n := int(mb.Len()); n > 0 {
+		if r.onBytes != nil {
+			r.onBytes(int64(n))
+		}
+		if !r.policy.accountLinkBytesContext(r.userID, n, r.stop) {
+			buf.ReleaseMulti(mb)
+			r.markDone()
+			return nil, fmt.Errorf("quota exceeded")
+		}
 	}
 	if err != nil {
 		r.markDone()
@@ -333,18 +372,24 @@ type quotaWriter struct {
 	policy    *policyEngine
 	stop      <-chan struct{}
 	ls        *xrayLinkSession
+	onBytes   func(int64)
 	closeOnce sync.Once
 }
 
 func (w *quotaWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	if n := int(mb.Len()); n > 0 && !w.policy.accountLinkBytesContext(w.userID, n, w.stop) {
-		buf.ReleaseMulti(mb)
-		w.closeOnce.Do(func() {
-			if w.ls != nil {
-				w.ls.dirDone()
-			}
-		})
-		return fmt.Errorf("quota exceeded")
+	if n := int(mb.Len()); n > 0 {
+		if w.onBytes != nil {
+			w.onBytes(int64(n))
+		}
+		if !w.policy.accountLinkBytesContext(w.userID, n, w.stop) {
+			buf.ReleaseMulti(mb)
+			w.closeOnce.Do(func() {
+				if w.ls != nil {
+					w.ls.dirDone()
+				}
+			})
+			return fmt.Errorf("quota exceeded")
+		}
 	}
 	return w.Writer.WriteMultiBuffer(mb)
 }
@@ -373,15 +418,19 @@ func wrapQuotaIO(policy *policyEngine, userID string, r buf.Reader, w buf.Writer
 }
 
 func wrapQuotaIOSession(policy *policyEngine, userID string, r buf.Reader, w buf.Writer, ls *xrayLinkSession) (buf.Reader, buf.Writer) {
+	return wrapQuotaIOSessionWithStats(policy, userID, r, w, ls, nil, nil)
+}
+
+func wrapQuotaIOSessionWithStats(policy *policyEngine, userID string, r buf.Reader, w buf.Writer, ls *xrayLinkSession, onRead, onWrite func(int64)) (buf.Reader, buf.Writer) {
 	var stop <-chan struct{}
 	if ls != nil {
 		stop = ls.stop
 	}
 	if r != nil {
-		r = &quotaReader{Reader: r, policy: policy, userID: userID, stop: stop, ls: ls}
+		r = &quotaReader{Reader: r, policy: policy, userID: userID, stop: stop, ls: ls, onBytes: onRead}
 	}
 	if w != nil {
-		w = &quotaWriter{Writer: w, policy: policy, userID: userID, stop: stop, ls: ls}
+		w = &quotaWriter{Writer: w, policy: policy, userID: userID, stop: stop, ls: ls, onBytes: onWrite}
 	}
 	return r, w
 }
@@ -649,16 +698,20 @@ func restoreXraySystemDialer() {
 }
 
 func startXrayInstance(raw []byte, policy *policyEngine) (*xraycore.Instance, error) {
+	return startXrayInstanceWithStats(raw, policy, nil)
+}
+
+func startXrayInstanceWithStats(raw []byte, policy *policyEngine, stats *statsCollector) (*xraycore.Instance, error) {
 	inst, err := xraycore.StartInstance("json", raw)
 	if err != nil {
 		return nil, err
 	}
 	captureXraySystemDialer(inst)
-	wrapXrayDispatcher(inst, policy)
+	wrapXrayDispatcher(inst, policy, stats)
 	return inst, nil
 }
 
-func wrapXrayDispatcher(inst *xraycore.Instance, policy *policyEngine) {
+func wrapXrayDispatcher(inst *xraycore.Instance, policy *policyEngine, stats *statsCollector) {
 	feat := inst.GetFeature(routing.DispatcherType())
 	inner, ok := feat.(routing.Dispatcher)
 	if !ok || inner == nil {
@@ -667,7 +720,7 @@ func wrapXrayDispatcher(inst *xraycore.Instance, policy *policyEngine) {
 	if _, wrapped := inner.(*ipLimitDispatcher); wrapped {
 		return
 	}
-	next := &ipLimitDispatcher{Dispatcher: inner, policy: policy}
+	next := &ipLimitDispatcher{Dispatcher: inner, policy: policy, stats: stats}
 	replaceXrayFeature(inst, inner, next)
 	patchInboundMuxDispatchers(inst, next)
 	wrapWorkerProxyRecover(inst)

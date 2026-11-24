@@ -35,6 +35,15 @@ type xrayCore struct {
 	lastDialStack   string
 	fronts          []*spliceFront
 	policy          *policyEngine
+	stats           *statsCollector
+}
+
+func (c *xrayCore) SetStatsEnabled(on bool) {
+	c.stats.SetEnabled(on)
+}
+
+func (c *xrayCore) DrainStats(topN int) StatsBatch {
+	return c.stats.Drain(topN)
 }
 
 func (c *xrayCore) SetForwarding(outbounds []OutboundSpec, routes []RouteSpec) {
@@ -52,7 +61,11 @@ func (c *xrayCore) SetDialStack(stack string) {
 }
 
 func newXrayCore() *xrayCore {
-	return &xrayCore{denied: map[string]struct{}{}, policy: newPolicyEngineWithRole("xray")}
+	return &xrayCore{
+		denied: map[string]struct{}{},
+		policy: newPolicyEngineWithRole("xray"),
+		stats:  newStatsCollector(),
+	}
 }
 
 func (c *xrayCore) Name() string    { return "xray" }
@@ -372,7 +385,7 @@ func (c *xrayCore) restartLocked() error {
 		c.rememberGood()
 		return nil
 	}
-	inst, err := startXrayInstance(raw, c.policy)
+	inst, err := startXrayInstanceWithStats(raw, c.policy, c.stats)
 	if err != nil {
 		c.restoreLastGood()
 		return err
@@ -413,7 +426,7 @@ func (c *xrayCore) restoreLastGood() {
 		c.policy.setDialStack(c.dialStack)
 		return
 	}
-	inst, err := startXrayInstance(raw, c.policy)
+	inst, err := startXrayInstanceWithStats(raw, c.policy, c.stats)
 	if err != nil {
 		c.dialStack = attempted
 		c.policy.setDialStack(c.dialStack)
@@ -454,6 +467,7 @@ func (c *xrayCore) buildConfig(users []UserSpec, inbounds []InboundSpec, outboun
 	var loopUsers []string
 	listenTags := map[string][]string{}
 	builtTags := map[string][]string{}
+	tagToInbound := map[string]string{}
 	for i, in := range inbounds {
 		specKey := inboundSpecKey(in)
 		tag := in.ID
@@ -626,6 +640,7 @@ func (c *xrayCore) buildConfig(users []UserSpec, inbounds []InboundSpec, outboun
 			builtTags[specKey] = append(builtTags[specKey], useTag)
 			if in.ID != "" {
 				listenTags[in.ID] = append(listenTags[in.ID], useTag)
+				tagToInbound[useTag] = in.ID
 			}
 			if identityFront(in, users) {
 				skipIP = append(skipIP, useTag)
@@ -678,6 +693,7 @@ func (c *xrayCore) buildConfig(users []UserSpec, inbounds []InboundSpec, outboun
 	}
 	c.lastInboundTags = builtTags
 	c.policy.setLoopUsers(loopUsers)
+	c.stats.setTagMap(tagToInbound)
 	c.policy.setSkipCoreIP(skipIP)
 	c.policy.setMeterCore(meterTags)
 	cfg := map[string]any{
