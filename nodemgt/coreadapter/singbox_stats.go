@@ -254,13 +254,13 @@ func (t *statsTracker) RoutedConnection(ctx context.Context, conn net.Conn, meta
 	if !ok {
 		return conn
 	}
-	// In sing-box Router.RoutedConnection, conn is the outbound connection:
-	// Write sends client upload bytes to target; Read receives target download bytes.
+	// In sing-box Router.RoutedConnection, conn is the inbound client connection:
+	// Read receives client upload bytes; Write sends target download bytes back to client.
 	readCount := func(n int64) {
-		t.collector.record(inboundID, userID, domain, 0, n)
+		t.collector.record(inboundID, userID, domain, n, 0)
 	}
 	writeCount := func(n int64) {
-		t.collector.record(inboundID, userID, domain, n, 0)
+		t.collector.record(inboundID, userID, domain, 0, n)
 	}
 	return bufio.NewCounterConn(conn, []N.CountFunc{readCount}, []N.CountFunc{writeCount})
 }
@@ -273,13 +273,13 @@ func (t *statsTracker) RoutedPacketConnection(ctx context.Context, conn N.Packet
 	if !ok {
 		return conn
 	}
-	// In sing-box Router.RoutedConnection, conn is the outbound connection:
-	// Write sends client upload bytes to target; Read receives target download bytes.
+	// In sing-box Router.RoutedConnection, conn is the inbound client connection:
+	// Read receives client upload bytes; Write sends target download bytes back to client.
 	readCount := func(n int64) {
-		t.collector.record(inboundID, userID, domain, 0, n)
+		t.collector.record(inboundID, userID, domain, n, 0)
 	}
 	writeCount := func(n int64) {
-		t.collector.record(inboundID, userID, domain, n, 0)
+		t.collector.record(inboundID, userID, domain, 0, n)
 	}
 	return bufio.NewCounterPacketConn(conn, []N.CountFunc{readCount}, []N.CountFunc{writeCount})
 }
