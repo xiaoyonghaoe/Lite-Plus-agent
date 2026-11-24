@@ -276,29 +276,32 @@ func BindResult(raw interface{}, target interface{}) error {
 
 
 type RealityProbeParams struct {
-	RequestID  string `json:"request_id"`
-	Dest       string `json:"dest"`
-	ServerName string `json:"server_name"`
+	RequestID  string   `json:"request_id"`
+	Dest       string   `json:"dest"`
+	ServerName string   `json:"server_name"`
+	Targets    []string `json:"targets,omitempty"`
 }
 
 type RealityProbeResultParams struct {
-	RequestID    string   `json:"request_id"`
-	Dest         string   `json:"dest"`
-	ServerName   string   `json:"server_name"`
-	Local        bool     `json:"local"`
-	Reachable    bool     `json:"reachable"`
-	OK           bool     `json:"ok"`
-	RTTMs        int64    `json:"rtt_ms"`
-	TLSVersion   string   `json:"tls_version,omitempty"`
-	TLS13        bool     `json:"tls13"`
-	ALPN         string   `json:"alpn,omitempty"`
-	H2           bool     `json:"h2"`
-	CertValid    bool     `json:"cert_valid"`
-	CertError    string   `json:"cert_error,omitempty"`
-	CertSubject  string   `json:"cert_subject,omitempty"`
-	CertIssuer   string   `json:"cert_issuer,omitempty"`
-	CertSANs     []string `json:"cert_sans,omitempty"`
-	CertNotAfter string   `json:"cert_not_after,omitempty"`
-	Warnings     []string `json:"warnings,omitempty"`
-	Error        string   `json:"error,omitempty"`
+	RequestID      string                     `json:"request_id"`
+	Dest           string                     `json:"dest"`
+	ServerName     string                     `json:"server_name"`
+	Local          bool                       `json:"local"`
+	Reachable      bool                       `json:"reachable"`
+	OK             bool                       `json:"ok"`
+	RTTMs          int64                      `json:"rtt_ms"`
+	TLSVersion     string                     `json:"tls_version,omitempty"`
+	TLS13          bool                       `json:"tls13"`
+	ALPN           string                     `json:"alpn,omitempty"`
+	H2             bool                       `json:"h2"`
+	CertValid      bool                       `json:"cert_valid"`
+	CertError      string                     `json:"cert_error,omitempty"`
+	CertSubject    string                     `json:"cert_subject,omitempty"`
+	CertIssuer     string                     `json:"cert_issuer,omitempty"`
+	CertSANs       []string                   `json:"cert_sans,omitempty"`
+	CertNotAfter   string                     `json:"cert_not_after,omitempty"`
+	CertChainBytes int                        `json:"cert_chain_bytes,omitempty"`
+	Warnings       []string                   `json:"warnings,omitempty"`
+	Error          string                     `json:"error,omitempty"`
+	Results        []RealityProbeResultParams `json:"results,omitempty"`
 }

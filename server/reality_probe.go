@@ -6,17 +6,55 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	v2 "github.com/nuomiiiii/lite-agent/protocol/v2"
 )
 
 func NewRealityProbeTask(p v2.RealityProbeParams) {
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	res := ProbeRealityTarget(ctx, p.Dest, p.ServerName)
-	res.RequestID = p.RequestID
+	var res v2.RealityProbeResultParams
+	if len(p.Targets) > 0 {
+		targets := p.Targets
+		if len(targets) > 12 {
+			targets = targets[:12]
+		}
+		results := make([]v2.RealityProbeResultParams, len(targets))
+		var wg sync.WaitGroup
+		for i, target := range targets {
+			wg.Add(1)
+			go func(idx int, t string) {
+				defer wg.Done()
+				sni := ""
+				if isLoopbackDest(extractDestHost(t)) {
+					sni = p.ServerName
+				}
+				results[idx] = ProbeRealityTarget(ctx, t, sni)
+			}(i, target)
+		}
+		wg.Wait()
+		sort.SliceStable(results, func(i, j int) bool {
+			if results[i].OK != results[j].OK {
+				return results[i].OK
+			}
+			if results[i].Reachable != results[j].Reachable {
+				return results[i].Reachable
+			}
+			return results[i].RTTMs < results[j].RTTMs
+		})
+		res = v2.RealityProbeResultParams{
+			RequestID: p.RequestID,
+			OK:        true,
+			Results:   results,
+		}
+	} else {
+		res = ProbeRealityTarget(ctx, p.Dest, p.ServerName)
+		res.RequestID = p.RequestID
+	}
 	payload := v2.Request{
 		JSONRPC: v2.Version,
 		Method:  v2.MethodNodemgtRealityProbeResult,
@@ -24,6 +62,14 @@ func NewRealityProbeTask(p v2.RealityProbeParams) {
 		ID:      fmt.Sprintf("reality-probe-%d", time.Now().UnixNano()),
 	}
 	reportV2Result(payload, "Failed to upload Reality probe result")
+}
+
+func extractDestHost(dest string) string {
+	trimmed := strings.TrimSpace(dest)
+	if host, _, err := net.SplitHostPort(trimmed); err == nil {
+		return host
+	}
+	return strings.Trim(trimmed, "[]")
 }
 
 func isLoopbackDest(host string) bool {
@@ -122,6 +168,11 @@ func ProbeRealityTarget(ctx context.Context, rawDest, rawSNI string) v2.RealityP
 
 	if len(state.PeerCertificates) > 0 {
 		leaf := state.PeerCertificates[0]
+		chainBytes := 0
+		for _, c := range state.PeerCertificates {
+			chainBytes += len(c.Raw)
+		}
+		out.CertChainBytes = chainBytes
 		out.CertSubject = leaf.Subject.CommonName
 		out.CertIssuer = leaf.Issuer.CommonName
 		if !leaf.NotAfter.IsZero() {
