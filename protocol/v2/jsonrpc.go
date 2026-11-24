@@ -32,7 +32,9 @@ const (
 	MethodNodemgtControlResult  = "nodemgt.controlResult"
 	MethodNodemgtUsage          = "nodemgt.usage"
 	MethodNodemgtPresence       = "nodemgt.presence"
-	MethodNodemgtStats          = "nodemgt.stats"
+	MethodNodemgtStats              = "nodemgt.stats"
+	MethodNodemgtRealityProbe       = "nodemgt.reality.probe"
+	MethodNodemgtRealityProbeResult = "nodemgt.reality.probe.result"
 	MethodAgentFirewallSnapshot = "agent.firewall.snapshot"
 	MethodAgentFirewallApply    = "agent.firewall.apply"
 	MethodAgentFirewallAdopt    = "agent.firewall.adopt"
@@ -270,4 +272,33 @@ func BindParams(raw interface{}, target interface{}) error {
 
 func BindResult(raw interface{}, target interface{}) error {
 	return BindParams(raw, target)
+}
+
+
+type RealityProbeParams struct {
+	RequestID  string `json:"request_id"`
+	Dest       string `json:"dest"`
+	ServerName string `json:"server_name"`
+}
+
+type RealityProbeResultParams struct {
+	RequestID    string   `json:"request_id"`
+	Dest         string   `json:"dest"`
+	ServerName   string   `json:"server_name"`
+	Local        bool     `json:"local"`
+	Reachable    bool     `json:"reachable"`
+	OK           bool     `json:"ok"`
+	RTTMs        int64    `json:"rtt_ms"`
+	TLSVersion   string   `json:"tls_version,omitempty"`
+	TLS13        bool     `json:"tls13"`
+	ALPN         string   `json:"alpn,omitempty"`
+	H2           bool     `json:"h2"`
+	CertValid    bool     `json:"cert_valid"`
+	CertError    string   `json:"cert_error,omitempty"`
+	CertSubject  string   `json:"cert_subject,omitempty"`
+	CertIssuer   string   `json:"cert_issuer,omitempty"`
+	CertSANs     []string `json:"cert_sans,omitempty"`
+	CertNotAfter string   `json:"cert_not_after,omitempty"`
+	Warnings     []string `json:"warnings,omitempty"`
+	Error        string   `json:"error,omitempty"`
 }

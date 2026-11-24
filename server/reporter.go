@@ -259,6 +259,14 @@ func processV2Event(method string, params interface{}, eventID string) bool {
 		if nodemgtrt := nodemgtRuntimeHandle(); nodemgtrt != nil {
 			return nodemgtrt(params, eventID)
 		}
+	case v2.MethodNodemgtRealityProbe:
+		var p v2.RealityProbeParams
+		if err := v2.BindParams(params, &p); err == nil {
+			go NewRealityProbeTask(p)
+			return true
+		} else {
+			log.Printf("bad v2 reality probe params: %v", err)
+		}
 		forgetV2Event(eventID)
 		log.Printf("nodemgt.control received before runtime start")
 		return false
