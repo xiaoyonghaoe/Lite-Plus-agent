@@ -153,4 +153,13 @@ func TestDomainNormalizationAndStatsCollector(t *testing.T) {
 	if !col.Drain(20).Empty() {
 		t.Fatalf("expected empty batch after drain")
 	}
+
+	// resolveBaseInbound must normalize -udp suffix and ignore internal nodemgt-core-* tags
+	col.setTagMap(map[string]string{"ss-inb-1": "ss-inb-1"})
+	if got := col.resolveBaseInbound("ss-inb-1-udp"); got != "ss-inb-1" {
+		t.Fatalf("resolveBaseInbound(ss-inb-1-udp) = %q, want ss-inb-1", got)
+	}
+	if got := col.resolveBaseInbound("nodemgt-core-home"); got != "" {
+		t.Fatalf("resolveBaseInbound(nodemgt-core-home) = %q, want empty", got)
+	}
 }

@@ -116,15 +116,25 @@ func (s *statsCollector) setTagMap(m map[string]string) {
 func (s *statsCollector) resolveBaseInbound(tag string) string {
 	tag = strings.TrimSpace(tag)
 	if tag == "" || s == nil {
-		return tag
+		return ""
+	}
+	if strings.HasPrefix(tag, "nodemgt-core-") || strings.HasPrefix(tag, "nodemgt-policy-") {
+		return ""
 	}
 	s.mu.Lock()
 	id, ok := s.tagToInbound[tag]
+	if !ok && strings.HasSuffix(tag, "-udp") {
+		id, ok = s.tagToInbound[strings.TrimSuffix(tag, "-udp")]
+	}
+	hasMap := len(s.tagToInbound) > 0
 	s.mu.Unlock()
 	if ok && id != "" {
 		return id
 	}
-	return tag
+	if hasMap {
+		return ""
+	}
+	return strings.TrimSuffix(tag, "-udp")
 }
 
 func (s *statsCollector) record(inboundID, userID, domain string, up, down int64) {
