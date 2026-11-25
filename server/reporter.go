@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/nuomiiiii/lite-agent/monitoring"
+	nodemgtruntime "github.com/nuomiiiii/lite-agent/nodemgt/runtime"
 	v2 "github.com/nuomiiiii/lite-agent/protocol/v2"
 	"github.com/nuomiiiii/lite-agent/runtimeconfig"
 )
@@ -145,6 +146,11 @@ func processV2ResponseEvents(resp *v2.Response) time.Duration {
 	if err := v2.BindResult(resp.Result, &result); err != nil {
 		log.Println("Failed to bind v2 event result:", err)
 		return reportIntervalDuration()
+	}
+	if result.StatsIntervalMS > 0 {
+		if rt := nodemgtruntime.Current(); rt != nil {
+			rt.SetStatsInterval(time.Duration(result.StatsIntervalMS) * time.Millisecond)
+		}
 	}
 	for _, event := range result.Events {
 		if processV2Event(event.Method, event.Params, event.ID) {

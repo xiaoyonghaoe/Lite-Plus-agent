@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-tun"
@@ -15,8 +16,10 @@ import (
 )
 
 const (
-	statsDefaultTopN   = 15
-	statsMaxDomainKeys = 2048
+	statsDefaultTopN        = 30
+	statsMaxDomainKeys      = 2048
+	statsConnFlushBytes     = 64 * 1024
+	statsConnFlushIntervalN = int64(2 * time.Second)
 )
 
 type InboundUsageDelta struct {
@@ -27,8 +30,11 @@ type InboundUsageDelta struct {
 }
 
 type DomainUsageDelta struct {
-	InboundID string `json:"inbound_id"`
+	UserID    string `json:"user_id"`
+	InboundID string `json:"inbound_id,omitempty"`
 	Domain    string `json:"domain"`
+	UpBytes   int64  `json:"up_bytes"`
+	DownBytes int64  `json:"down_bytes"`
 	Bytes     int64  `json:"bytes"`
 }
 
@@ -51,12 +57,12 @@ type inbBytes struct {
 	down int64
 }
 
-type inbDomainKey struct {
-	inboundID string
-	domain    string
+type userDomainKey struct {
+	userID string
+	domain string
 }
 
-// statsCollector aggregates per-(inbound, user) and per-(inbound, root-domain)
+// statsCollector aggregates per-(inbound, user) and per-(user, root-domain)
 // byte counters in memory. When disabled, Enabled() returns false via a single
 // atomic load so connections incur zero lock or wrapper overhead.
 type statsCollector struct {
@@ -64,14 +70,14 @@ type statsCollector struct {
 	mu           sync.Mutex
 	tagToInbound map[string]string
 	inboundUsage map[inbUserKey]*inbBytes
-	domainUsage  map[inbDomainKey]int64
+	domainUsage  map[userDomainKey]*inbBytes
 }
 
 func newStatsCollector() *statsCollector {
 	return &statsCollector{
 		tagToInbound: map[string]string{},
 		inboundUsage: map[inbUserKey]*inbBytes{},
-		domainUsage:  map[inbDomainKey]int64{},
+		domainUsage:  map[userDomainKey]*inbBytes{},
 	}
 }
 
@@ -87,7 +93,7 @@ func (s *statsCollector) SetEnabled(on bool) {
 	if !on {
 		s.mu.Lock()
 		s.inboundUsage = map[inbUserKey]*inbBytes{}
-		s.domainUsage = map[inbDomainKey]int64{}
+		s.domainUsage = map[userDomainKey]*inbBytes{}
 		s.mu.Unlock()
 	}
 }
@@ -145,16 +151,71 @@ func (s *statsCollector) record(inboundID, userID, domain string, up, down int64
 		}
 	}
 
-	if domain != "" {
-		dk := inbDomainKey{inboundID: inboundID, domain: domain}
-		if _, exists := s.domainUsage[dk]; exists || len(s.domainUsage) < statsMaxDomainKeys {
-			s.domainUsage[dk] += up + down
+	if userID != "" && domain != "" {
+		dk := userDomainKey{userID: userID, domain: domain}
+		entry := s.domainUsage[dk]
+		if entry == nil {
+			if len(s.domainUsage) < statsMaxDomainKeys {
+				entry = &inbBytes{}
+				s.domainUsage[dk] = entry
+			}
+		}
+		if entry != nil {
+			if up > 0 {
+				entry.up += up
+			}
+			if down > 0 {
+				entry.down += down
+			}
 		}
 	}
 }
 
+// newConnCallbacks creates per-connection atomic accumulators that flush into
+// statsCollector when buffered bytes reach statsConnFlushBytes, after
+// statsConnFlushIntervalN, or when the returned flush callback is invoked on close.
+func (s *statsCollector) newConnCallbacks(inboundID, userID, domain string) (upFn, downFn func(int64), flush func()) {
+	var upBuf, downBuf atomic.Int64
+	var lastFlush atomic.Int64
+	lastFlush.Store(time.Now().UnixNano())
+
+	flush = func() {
+		u := upBuf.Swap(0)
+		d := downBuf.Swap(0)
+		if u > 0 || d > 0 {
+			lastFlush.Store(time.Now().UnixNano())
+			s.record(inboundID, userID, domain, u, d)
+		}
+	}
+	maybeFlush := func() {
+		if upBuf.Load()+downBuf.Load() >= statsConnFlushBytes {
+			flush()
+			return
+		}
+		nowNs := time.Now().UnixNano()
+		if nowNs-lastFlush.Load() >= statsConnFlushIntervalN {
+			flush()
+		}
+	}
+	upFn = func(n int64) {
+		if n <= 0 {
+			return
+		}
+		upBuf.Add(n)
+		maybeFlush()
+	}
+	downFn = func(n int64) {
+		if n <= 0 {
+			return
+		}
+		downBuf.Add(n)
+		maybeFlush()
+	}
+	return upFn, downFn, flush
+}
+
 // Drain swaps out the accumulated counters and returns a StatsBatch with at most
-// topN domains per inboundID.
+// topN domains per userID.
 func (s *statsCollector) Drain(topN int) StatsBatch {
 	if s == nil {
 		return StatsBatch{}
@@ -166,7 +227,7 @@ func (s *statsCollector) Drain(topN int) StatsBatch {
 	inbMap := s.inboundUsage
 	domMap := s.domainUsage
 	s.inboundUsage = map[inbUserKey]*inbBytes{}
-	s.domainUsage = map[inbDomainKey]int64{}
+	s.domainUsage = map[userDomainKey]*inbBytes{}
 	s.mu.Unlock()
 
 	var batch StatsBatch
@@ -186,18 +247,21 @@ func (s *statsCollector) Drain(topN int) StatsBatch {
 	}
 
 	if len(domMap) > 0 {
-		byInb := map[string][]DomainUsageDelta{}
-		for k, total := range domMap {
+		byUser := map[string][]DomainUsageDelta{}
+		for k, v := range domMap {
+			total := v.up + v.down
 			if total <= 0 {
 				continue
 			}
-			byInb[k.inboundID] = append(byInb[k.inboundID], DomainUsageDelta{
-				InboundID: k.inboundID,
+			byUser[k.userID] = append(byUser[k.userID], DomainUsageDelta{
+				UserID:    k.userID,
 				Domain:    k.domain,
+				UpBytes:   v.up,
+				DownBytes: v.down,
 				Bytes:     total,
 			})
 		}
-		for _, list := range byInb {
+		for _, list := range byUser {
 			sort.Slice(list, func(i, j int) bool {
 				if list[i].Bytes != list[j].Bytes {
 					return list[i].Bytes > list[j].Bytes
@@ -246,6 +310,30 @@ func (t *statsTracker) extractMeta(metadata adapter.InboundContext) (inboundID, 
 	return inboundID, userID, domain, true
 }
 
+type flushOnCloseConn struct {
+	net.Conn
+	flush func()
+}
+
+func (c *flushOnCloseConn) Close() error {
+	if c.flush != nil {
+		c.flush()
+	}
+	return c.Conn.Close()
+}
+
+type flushOnClosePacketConn struct {
+	N.PacketConn
+	flush func()
+}
+
+func (c *flushOnClosePacketConn) Close() error {
+	if c.flush != nil {
+		c.flush()
+	}
+	return c.PacketConn.Close()
+}
+
 func (t *statsTracker) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
 	if conn == nil {
 		return conn
@@ -256,13 +344,11 @@ func (t *statsTracker) RoutedConnection(ctx context.Context, conn net.Conn, meta
 	}
 	// In sing-box Router.RoutedConnection, conn is the inbound client connection:
 	// Read receives client upload bytes; Write sends target download bytes back to client.
-	readCount := func(n int64) {
-		t.collector.record(inboundID, userID, domain, n, 0)
+	readCount, writeCount, flush := t.collector.newConnCallbacks(inboundID, userID, domain)
+	return &flushOnCloseConn{
+		Conn:  bufio.NewCounterConn(conn, []N.CountFunc{readCount}, []N.CountFunc{writeCount}),
+		flush: flush,
 	}
-	writeCount := func(n int64) {
-		t.collector.record(inboundID, userID, domain, 0, n)
-	}
-	return bufio.NewCounterConn(conn, []N.CountFunc{readCount}, []N.CountFunc{writeCount})
 }
 
 func (t *statsTracker) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
@@ -275,13 +361,11 @@ func (t *statsTracker) RoutedPacketConnection(ctx context.Context, conn N.Packet
 	}
 	// In sing-box Router.RoutedConnection, conn is the inbound client connection:
 	// Read receives client upload bytes; Write sends target download bytes back to client.
-	readCount := func(n int64) {
-		t.collector.record(inboundID, userID, domain, n, 0)
+	readCount, writeCount, flush := t.collector.newConnCallbacks(inboundID, userID, domain)
+	return &flushOnClosePacketConn{
+		PacketConn: bufio.NewCounterPacketConn(conn, []N.CountFunc{readCount}, []N.CountFunc{writeCount}),
+		flush:      flush,
 	}
-	writeCount := func(n int64) {
-		t.collector.record(inboundID, userID, domain, 0, n)
-	}
-	return bufio.NewCounterPacketConn(conn, []N.CountFunc{readCount}, []N.CountFunc{writeCount})
 }
 
 func (t *statsTracker) RoutedFlow(ctx context.Context, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) tun.FlowTracker {

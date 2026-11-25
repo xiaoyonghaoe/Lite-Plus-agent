@@ -79,10 +79,11 @@ type Event struct {
 }
 
 type EventResult struct {
-	Status         string  `json:"status,omitempty"`
-	Events         []Event `json:"events,omitempty"`
-	NextIntervalMS int64   `json:"next_interval_ms,omitempty"`
-	HasMore        bool    `json:"has_more,omitempty"`
+	Status          string  `json:"status,omitempty"`
+	Events          []Event `json:"events,omitempty"`
+	NextIntervalMS  int64   `json:"next_interval_ms,omitempty"`
+	StatsIntervalMS int64   `json:"stats_interval_ms,omitempty"`
+	HasMore         bool    `json:"has_more,omitempty"`
 }
 
 type ConfigParams struct {

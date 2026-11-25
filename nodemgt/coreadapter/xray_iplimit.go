@@ -215,11 +215,9 @@ func (d *ipLimitDispatcher) xrayStatsCallbacks(ctx context.Context, dest xnet.De
 	if dest.Address != nil && dest.Address.Family().IsDomain() {
 		domain = normalizeRootDomain(dest.Address.Domain())
 	}
-	upFn = func(n int64) {
-		d.stats.record(effInb, userID, domain, n, 0)
-	}
-	downFn = func(n int64) {
-		d.stats.record(effInb, userID, domain, 0, n)
+	upFn, downFn, flush := d.stats.newConnCallbacks(effInb, userID, domain)
+	if flush != nil {
+		context.AfterFunc(ctx, flush)
 	}
 	return upFn, downFn
 }

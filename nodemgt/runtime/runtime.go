@@ -38,10 +38,19 @@ type Runtime struct {
 	ops           opLog
 	quota         *quota.Ledger
 	cancel        context.CancelFunc
-	result        func(method string, params any)
-	sender        func(method string, params any) error
-	geoBusy       atomic.Bool
+	result          func(method string, params any)
+	sender          func(method string, params any) error
+	geoBusy         atomic.Bool
+	statsIntervalNs atomic.Int64
+	statsWakeCh     chan struct{}
 }
+
+const (
+	defaultStatsInterval = 60 * time.Second
+	minStatsInterval     = 5 * time.Second
+	maxStatsInterval     = 5 * time.Minute
+	statsDrainTopN       = 30
+)
 
 type sentUsageBatch struct {
 	BatchID string    `json:"batch_id"`
@@ -143,7 +152,9 @@ func Start(configFile string, result func(method string, params any)) (*Runtime,
 		ops:           opLog{Applied: map[string]int{}},
 		cancel:        cancel,
 		result:        result,
+		statsWakeCh:   make(chan struct{}, 1),
 	}
+	rt.statsIntervalNs.Store(int64(defaultStatsInterval))
 	global = rt
 	log.Printf("Lite-Plus Agent cores: xray %s linked=%v; sing-box %s linked=%v",
 		coreadapter.XrayVersion, rt.cores[0].Linked(),
@@ -189,15 +200,59 @@ func (r *Runtime) SetSender(fn func(method string, params any) error) {
 	r.sender = fn
 }
 
+func (r *Runtime) StatsInterval() time.Duration {
+	if r == nil {
+		return defaultStatsInterval
+	}
+	ns := r.statsIntervalNs.Load()
+	if ns <= 0 {
+		return defaultStatsInterval
+	}
+	return time.Duration(ns)
+}
+
+func (r *Runtime) SetStatsInterval(d time.Duration) {
+	if r == nil || d <= 0 {
+		return
+	}
+	if d < minStatsInterval {
+		d = minStatsInterval
+	}
+	if d > maxStatsInterval {
+		d = maxStatsInterval
+	}
+	prev := r.statsIntervalNs.Swap(int64(d))
+	if prev != int64(d) && r.statsWakeCh != nil {
+		select {
+		case r.statsWakeCh <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func resetLoopTimer(timer *time.Timer, d time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	if d <= 0 {
+		d = time.Second
+	}
+	timer.Reset(d)
+}
+
 func (r *Runtime) loop(ctx context.Context) {
 	expireTick := time.NewTicker(time.Second)
 	usageTick := time.NewTicker(15 * time.Second)
-	statsTick := time.NewTicker(60 * time.Second)
+	statsTimer := time.NewTimer(r.StatsInterval())
+	lastStatsFlush := time.Now()
 	certTick := time.NewTicker(time.Minute)
 	geoTick := time.NewTicker(12 * time.Hour)
 	defer expireTick.Stop()
 	defer usageTick.Stop()
-	defer statsTick.Stop()
+	defer statsTimer.Stop()
 	defer certTick.Stop()
 	defer geoTick.Stop()
 	for {
@@ -208,8 +263,20 @@ func (r *Runtime) loop(ctx context.Context) {
 			r.expireUsers()
 		case <-usageTick.C:
 			r.FlushUsage()
-		case <-statsTick.C:
+		case <-statsTimer.C:
 			r.FlushStats()
+			lastStatsFlush = time.Now()
+			resetLoopTimer(statsTimer, r.StatsInterval())
+		case <-r.statsWakeCh:
+			interval := r.StatsInterval()
+			rem := interval - time.Since(lastStatsFlush)
+			if rem <= 0 {
+				r.FlushStats()
+				lastStatsFlush = time.Now()
+				resetLoopTimer(statsTimer, interval)
+			} else {
+				resetLoopTimer(statsTimer, rem)
+			}
 		case <-certTick.C:
 			r.reloadRenewedFileCerts()
 		case <-geoTick.C:
@@ -1386,7 +1453,7 @@ func (r *Runtime) FlushStats() {
 		if !ok {
 			continue
 		}
-		part := drainer.DrainStats(15)
+		part := drainer.DrainStats(statsDrainTopN)
 		if len(part.InboundUsage) > 0 {
 			merged.InboundUsage = append(merged.InboundUsage, part.InboundUsage...)
 		}

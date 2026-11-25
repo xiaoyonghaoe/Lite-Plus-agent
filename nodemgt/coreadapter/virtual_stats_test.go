@@ -116,18 +116,38 @@ func TestDomainNormalizationAndStatsCollector(t *testing.T) {
 	for i := 1; i <= 25; i++ {
 		col.record("inb-1#home", "u1", fmt.Sprintf("site%02d.com", i), int64(i*10), int64(i*100))
 	}
-	batch := col.Drain(15)
-	if len(batch.InboundUsage) != 1 {
-		t.Fatalf("expected 1 inbound usage row, got %d", len(batch.InboundUsage))
+	// Separate user should have independent top-N bucket and up/down split
+	upFn, downFn, flush := col.newConnCallbacks("inb-1", "u2", "youtube.com")
+	upFn(120)
+	downFn(880)
+	flush()
+
+	batch := col.Drain(20)
+	if len(batch.InboundUsage) != 2 {
+		t.Fatalf("expected 2 inbound usage rows, got %d", len(batch.InboundUsage))
 	}
-	if len(batch.DomainTop) != 15 {
-		t.Fatalf("expected 15 top domains, got %d", len(batch.DomainTop))
+	if len(batch.DomainTop) != 21 {
+		t.Fatalf("expected 21 domain rows (20 for u1 + 1 for u2), got %d", len(batch.DomainTop))
 	}
-	if batch.DomainTop[0].Domain != "site25.com" || batch.DomainTop[14].Domain != "site11.com" {
-		t.Fatalf("unexpected top domain ordering: first=%s last=%s", batch.DomainTop[0].Domain, batch.DomainTop[14].Domain)
+	var u1Domains []DomainUsageDelta
+	var u2Domain *DomainUsageDelta
+	for i := range batch.DomainTop {
+		d := batch.DomainTop[i]
+		if d.UserID == "u1" {
+			u1Domains = append(u1Domains, d)
+		} else if d.UserID == "u2" {
+			cp := d
+			u2Domain = &cp
+		}
+	}
+	if len(u1Domains) != 20 || u1Domains[0].Domain != "site25.com" || u1Domains[19].Domain != "site06.com" {
+		t.Fatalf("unexpected u1 top domain ordering: len=%d first=%+v", len(u1Domains), u1Domains[0])
+	}
+	if u2Domain == nil || u2Domain.Domain != "youtube.com" || u2Domain.UpBytes != 120 || u2Domain.DownBytes != 880 || u2Domain.Bytes != 1000 {
+		t.Fatalf("unexpected u2 domain delta: %+v", u2Domain)
 	}
 	// Second drain should be empty
-	if !col.Drain(15).Empty() {
+	if !col.Drain(20).Empty() {
 		t.Fatalf("expected empty batch after drain")
 	}
 }
