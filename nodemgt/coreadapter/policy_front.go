@@ -1414,6 +1414,28 @@ func attachPolicyExit(obs, rules []map[string]any, users []UserSpec, policyTags 
 			wrapped = append(wrapped, rule)
 			continue
 		}
+		ruleUsers := ruleStringList(rule[userKey])
+		if len(ruleUsers) > 0 {
+			for _, ru := range ruleUsers {
+				baseUID, _ := SplitVirtualUserKey(ru)
+				if _, ok := byID[baseUID]; !ok {
+					continue
+				}
+				wr := cloneAnyMap(rule)
+				if wr == nil {
+					wr = map[string]any{}
+				}
+				if xray {
+					wr["type"] = "field"
+				}
+				wr[inboundKey] = policyIn
+				wr[userKey] = []string{ru}
+				wr[outboundKey] = ensureVia(outTag, baseUID)
+				wrapped = append(wrapped, wr)
+			}
+			wrapped = append(wrapped, rule)
+			continue
+		}
 		for _, u := range live {
 			wr := cloneAnyMap(rule)
 			if wr == nil {

@@ -163,3 +163,45 @@ func TestDomainNormalizationAndStatsCollector(t *testing.T) {
 		t.Fatalf("resolveBaseInbound(nodemgt-core-home) = %q, want empty", got)
 	}
 }
+
+func TestAttachPolicyExitPreservesVirtualInboundUser(t *testing.T) {
+	obs := []map[string]any{
+		{"type": "direct", "tag": "direct"},
+		{"type": "shadowsocks", "tag": "out-home", "server": "1.2.3.4", "server_port": 8388},
+	}
+	rules := []map[string]any{
+		{"inbound": []string{"inb-1"}, "auth_user": []string{"u1@home"}, "outbound": "out-home"},
+	}
+	users := []UserSpec{
+		{ID: "u1", UUID: "11111111-1111-1111-1111-111111111111", Username: "alice", Password: "secret", InboundIDs: []string{"inb-1", "inb-1#home"}},
+	}
+	_, outRules, _, _, err := attachPolicyExit(obs, rules, users, []string{"inb-1"}, false, nil)
+	if err != nil {
+		t.Fatalf("attachPolicyExit failed: %v", err)
+	}
+	wantDirect := policyRouteTag("u1", "direct")
+	wantHome := policyRouteTag("u1", "out-home")
+	sawVirtualHome := false
+	sawBaseDirect := false
+	for _, r := range outRules {
+		authUsers := ruleStringList(r["auth_user"])
+		outTag, _ := r["outbound"].(string)
+		for _, au := range authUsers {
+			if au == "u1" && outTag != wantDirect && outTag != "direct" {
+				t.Fatalf("primary user u1 was erroneously routed to %q by virtual inbound rule: %#v", outTag, r)
+			}
+			if au == "u1@home" && outTag == wantHome {
+				sawVirtualHome = true
+			}
+			if au == "u1" && outTag == wantDirect {
+				sawBaseDirect = true
+			}
+		}
+	}
+	if !sawVirtualHome {
+		t.Fatalf("expected virtual user u1@home to route via out-home, got rules: %#v", outRules)
+	}
+	if !sawBaseDirect {
+		t.Fatalf("expected primary user u1 to fall back to direct, got rules: %#v", outRules)
+	}
+}
