@@ -143,8 +143,11 @@ func TestDomainNormalizationAndStatsCollector(t *testing.T) {
 	if len(u1Domains) != 20 || u1Domains[0].Domain != "site25.com" || u1Domains[19].Domain != "site06.com" {
 		t.Fatalf("unexpected u1 top domain ordering: len=%d first=%+v", len(u1Domains), u1Domains[0])
 	}
-	if u2Domain == nil || u2Domain.Domain != "youtube.com" || u2Domain.UpBytes != 120 || u2Domain.DownBytes != 880 || u2Domain.Bytes != 1000 {
+	if u2Domain == nil || u2Domain.InboundID != "inb-1" || u2Domain.Domain != "youtube.com" || u2Domain.UpBytes != 120 || u2Domain.DownBytes != 880 || u2Domain.Bytes != 1000 {
 		t.Fatalf("unexpected u2 domain delta: %+v", u2Domain)
+	}
+	if u1Domains[0].InboundID != "inb-1#home" {
+		t.Fatalf("expected virtual inbound_id inb-1#home on u1 domain delta, got %q", u1Domains[0].InboundID)
 	}
 	// Second drain should be empty
 	if !col.Drain(20).Empty() {

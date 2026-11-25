@@ -57,27 +57,29 @@ type inbBytes struct {
 	down int64
 }
 
-type userDomainKey struct {
-	userID string
-	domain string
+type userInboundDomainKey struct {
+	userID    string
+	inboundID string
+	domain    string
 }
 
-// statsCollector aggregates per-(inbound, user) and per-(user, root-domain)
-// byte counters in memory. When disabled, Enabled() returns false via a single
-// atomic load so connections incur zero lock or wrapper overhead.
+// statsCollector aggregates per-(inbound, user) and per-(user, inbound, root-domain)
+// byte counters in memory. Virtual inbounds (e.g. "inb_1#home") are tracked as
+// independent inbounds just like normal inbounds. When disabled, Enabled() returns
+// false via a single atomic load so connections incur zero lock or wrapper overhead.
 type statsCollector struct {
 	enabled      atomic.Bool
 	mu           sync.Mutex
 	tagToInbound map[string]string
 	inboundUsage map[inbUserKey]*inbBytes
-	domainUsage  map[userDomainKey]*inbBytes
+	domainUsage  map[userInboundDomainKey]*inbBytes
 }
 
 func newStatsCollector() *statsCollector {
 	return &statsCollector{
 		tagToInbound: map[string]string{},
 		inboundUsage: map[inbUserKey]*inbBytes{},
-		domainUsage:  map[userDomainKey]*inbBytes{},
+		domainUsage:  map[userInboundDomainKey]*inbBytes{},
 	}
 }
 
@@ -93,7 +95,7 @@ func (s *statsCollector) SetEnabled(on bool) {
 	if !on {
 		s.mu.Lock()
 		s.inboundUsage = map[inbUserKey]*inbBytes{}
-		s.domainUsage = map[userDomainKey]*inbBytes{}
+		s.domainUsage = map[userInboundDomainKey]*inbBytes{}
 		s.mu.Unlock()
 	}
 }
@@ -152,7 +154,7 @@ func (s *statsCollector) record(inboundID, userID, domain string, up, down int64
 	}
 
 	if userID != "" && domain != "" {
-		dk := userDomainKey{userID: userID, domain: domain}
+		dk := userInboundDomainKey{userID: userID, inboundID: inboundID, domain: domain}
 		entry := s.domainUsage[dk]
 		if entry == nil {
 			if len(s.domainUsage) < statsMaxDomainKeys {
@@ -227,7 +229,7 @@ func (s *statsCollector) Drain(topN int) StatsBatch {
 	inbMap := s.inboundUsage
 	domMap := s.domainUsage
 	s.inboundUsage = map[inbUserKey]*inbBytes{}
-	s.domainUsage = map[userDomainKey]*inbBytes{}
+	s.domainUsage = map[userInboundDomainKey]*inbBytes{}
 	s.mu.Unlock()
 
 	var batch StatsBatch
@@ -247,21 +249,24 @@ func (s *statsCollector) Drain(topN int) StatsBatch {
 	}
 
 	if len(domMap) > 0 {
-		byUser := map[string][]DomainUsageDelta{}
+		type scopeKey struct{ userID, inboundID string }
+		byScope := map[scopeKey][]DomainUsageDelta{}
 		for k, v := range domMap {
 			total := v.up + v.down
 			if total <= 0 {
 				continue
 			}
-			byUser[k.userID] = append(byUser[k.userID], DomainUsageDelta{
+			sk := scopeKey{userID: k.userID, inboundID: k.inboundID}
+			byScope[sk] = append(byScope[sk], DomainUsageDelta{
 				UserID:    k.userID,
+				InboundID: k.inboundID,
 				Domain:    k.domain,
 				UpBytes:   v.up,
 				DownBytes: v.down,
 				Bytes:     total,
 			})
 		}
-		for _, list := range byUser {
+		for _, list := range byScope {
 			sort.Slice(list, func(i, j int) bool {
 				if list[i].Bytes != list[j].Bytes {
 					return list[i].Bytes > list[j].Bytes
