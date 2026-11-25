@@ -491,7 +491,7 @@ func protectionProbeScript(kind string) string {
 	case "meter":
 		return "table inet liteplus_protection_probe {\n  chain input {\n    type filter hook input priority -201; policy accept;\n    tcp dport 9 ct state new meter p { ip saddr timeout 60s limit rate over 8/second burst 8 packets }\n  }\n}\n"
 	case "connlimit":
-		return "table inet liteplus_protection_probe {\n  chain input {\n    type filter hook input priority -201; policy accept;\n    tcp dport 9 meter p { ip saddr ct count over 8 }\n  }\n}\n"
+		return "table inet liteplus_protection_probe {\n  chain input {\n    type filter hook input priority -201; policy accept;\n    tcp dport 9 ct state new meter p { ip saddr ct count over 8 }\n  }\n}\n"
 	case "nflog":
 		return "table inet liteplus_protection_probe {\n  chain input {\n    type filter hook input priority -201; policy accept;\n    tcp dport 9 limit rate 1/second nflog group 4242 nflog-snaplen 64\n  }\n}\n"
 	default:
@@ -552,7 +552,7 @@ func protectionConnlimitLine(port, name, key string, limit int, enforce bool, de
 	if dest != "" {
 		line += dest + " "
 	}
-	line += fmt.Sprintf("tcp dport %s meter %s { %s ct count over %d } counter", port, name, key, limit)
+	line += fmt.Sprintf("tcp dport %s ct state new meter %s { %s ct count over %d } counter", port, name, key, limit)
 	if enforce {
 		line += " drop"
 	}
