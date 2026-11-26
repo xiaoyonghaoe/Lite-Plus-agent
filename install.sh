@@ -73,6 +73,7 @@ lite_service_name="lite-agent"
 legacy_service_name="komari-agent"
 github_repo="xiaoyonghaoe/Lite-Plus-agent"
 custom_layout=false
+enable_system_tuning=true
 
  
 
@@ -125,6 +126,10 @@ while [[ $# -gt 0 ]]; do
         --install-version)
             install_version="$2"
             shift 2
+            ;;
+        --install-no-tune)
+            enable_system_tuning=false
+            shift
             ;;
         --install*)
             log_warning "Unknown install parameter: $1"
@@ -1074,6 +1079,107 @@ else
     exit 1
 fi
 
+apply_system_tuning() {
+    if [ "$enable_system_tuning" != "true" ] || [ "$os_name" != "linux" ] || [ "$EUID" -ne 0 ] || [ -f /etc/NIXOS ]; then
+        return 0
+    fi
+
+    log_step "Applying safe Linux system tuning..."
+
+    local is_container=false
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        if systemd-detect-virt --container --quiet 2>/dev/null; then
+            is_container=true
+        fi
+    elif [ -f /.dockerenv ] || [ -f /run/.containerenv ]; then
+        is_container=true
+    fi
+
+    # 1. Limit systemd-journald disk usage to 50M
+    if [ "$init_system" = "systemd" ] && command -v systemctl >/dev/null 2>&1; then
+        mkdir -p /etc/systemd/journald.conf.d
+        cat > /etc/systemd/journald.conf.d/99-lite-plus-limit.conf << 'EOF'
+[Journal]
+SystemMaxUse=50M
+RuntimeMaxUse=20M
+EOF
+        systemctl restart systemd-journald 2>/dev/null || true
+        if command -v journalctl >/dev/null 2>&1; then
+            journalctl --vacuum-size=50M >/dev/null 2>&1 || true
+        fi
+        log_info "Configured journald disk limit (SystemMaxUse=50M)"
+    fi
+
+    if [ "$is_container" = "true" ]; then
+        log_info "Container environment detected; skipping Swap and kernel sysctl tuning"
+        return 0
+    fi
+
+    # Detect total physical memory in MiB
+    local mem_kb mem_mb
+    mem_kb=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)
+    mem_mb=$((mem_kb / 1024))
+
+    # 2. Create 1GB Swap on low-memory VMs (<= 2048 MiB) when no swap is active and > 2GB disk free
+    if [ "$mem_mb" -gt 0 ] && [ "$mem_mb" -le 2048 ] && ! swapon --show 2>/dev/null | grep -q .; then
+        local avail_kb
+        avail_kb=$(df --output=avail / 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
+        if [ -n "$avail_kb" ] && [ "$avail_kb" -gt 2097152 ] && [ ! -e /swapfile ]; then
+            if (fallocate -l 1G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none 2>/dev/null); then
+                chmod 600 /swapfile
+                if mkswap /swapfile >/dev/null 2>&1 && swapon /swapfile 2>/dev/null; then
+                    grep -q '^/swapfile ' /etc/fstab 2>/dev/null || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+                    log_info "Enabled 1GB swapfile (/swapfile)"
+                else
+                    rm -f /swapfile
+                    log_warning "Failed to activate /swapfile; skipping swap setup"
+                fi
+            fi
+        fi
+    fi
+
+    # 3. Apply safe TCP / memory / MPTCP sysctl tuning (alphabetically after vendor zz-*.conf)
+    if [ -d /etc/sysctl.d ]; then
+        local buf_max=16777216
+        if [ "$mem_mb" -gt 0 ] && [ "$mem_mb" -le 700 ]; then
+            buf_max=8388608
+        elif [ "$mem_mb" -gt 1536 ]; then
+            buf_max=33554432
+        fi
+
+        modprobe tcp_bbr 2>/dev/null || true
+        local bbr_lines=""
+        if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+            bbr_lines="net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr"
+        fi
+
+        cat > /etc/sysctl.d/zzz-lite-plus-tuning.conf << EOF
+# Managed by Lite-Plus-agent install.sh
+# Safe cross-border TCP, buffer, MPTCP & memory tuning (tcp_fastopen intentionally untouched)
+${bbr_lines}
+net.core.rmem_max = ${buf_max}
+net.core.wmem_max = ${buf_max}
+net.ipv4.tcp_rmem = 4096 87380 ${buf_max}
+net.ipv4.tcp_wmem = 4096 65536 ${buf_max}
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_ecn = 0
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_retries2 = 5
+-net.mptcp.enabled = 0
+vm.swappiness = 10
+EOF
+        if sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/zzz-lite-plus-tuning.conf >/dev/null 2>&1; then
+            log_success "Applied kernel sysctl tuning (/etc/sysctl.d/zzz-lite-plus-tuning.conf)"
+        else
+            log_warning "Failed to reload some sysctl parameters; continuing"
+        fi
+    fi
+}
+
 if [ "$init_system" != "nixos" ]; then
     if ! wait_new_service; then
         if managed_service_unit_exists "$lite_service_name" || managed_service_unit_exists "$legacy_service_name"; then
@@ -1084,6 +1190,7 @@ if [ "$init_system" != "nixos" ]; then
         exit 1
     fi
     retire_legacy_service
+    apply_system_tuning
 fi
 
 echo ""
