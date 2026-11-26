@@ -578,6 +578,8 @@ func (r *Runtime) applySnapshotModeWithOpLocked(payload json.RawMessage, mode sn
 			Kind    string `json:"kind"`
 			Code    string `json:"code"`
 			URL     string `json:"url"`
+			SRSURL  string `json:"srs_url"`
+			DatURL  string `json:"dat_url"`
 			Enabled bool   `json:"enabled"`
 		} `json:"geo_sources"`
 	}
@@ -726,17 +728,30 @@ func (r *Runtime) applySnapshotModeWithOpLocked(payload json.RawMessage, mode sn
 	ctx := context.Background()
 	if len(snap.GeoSources) > 0 {
 		customSRS := make(map[string]string, len(snap.GeoSources))
+		customDat := make(map[string]string, 2)
 		for _, src := range snap.GeoSources {
-			if !src.Enabled || strings.TrimSpace(src.URL) == "" {
+			if !src.Enabled {
 				continue
 			}
 			k := strings.ToLower(strings.TrimSpace(src.Kind))
 			c := strings.ToLower(strings.TrimSpace(src.Code))
-			if (k == "geosite" || k == "geoip") && c != "" {
-				customSRS[k+":"+c] = strings.TrimSpace(src.URL)
+			srsURL := strings.TrimSpace(src.SRSURL)
+			if srsURL == "" {
+				srsURL = strings.TrimSpace(src.URL)
+			}
+			datURL := strings.TrimSpace(src.DatURL)
+			if (k == "geosite" || k == "geoip") && c != "" && srsURL != "" {
+				customSRS[k+":"+c] = srsURL
+			}
+			if datURL != "" && (k == "geosite" || k == "geoip") {
+				datName := k + ".dat"
+				if _, exists := customDat[datName]; !exists {
+					customDat[datName] = datURL
+				}
 			}
 		}
 		r.geo.SetCustomSRS(customSRS)
+		r.geo.SetCustomDat(customDat)
 	}
 	if cores := usedCoreNames(inbounds); len(cores) > 0 {
 		if geosite, geoip := coreadapter.CollectGeo(rts); len(geosite) > 0 || len(geoip) > 0 {

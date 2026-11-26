@@ -27,11 +27,35 @@ type Store struct {
 	DatURLs   map[string][]string
 	SRSURLs   func(kind, code string) []string
 	CustomSRS map[string]string
+	CustomDat map[string]string
 	MinDat    int64
 	MinSRS    int64
 	MaxAge    time.Duration
 
 	mu sync.Mutex
+}
+
+// SetCustomDat updates custom download URLs for Xray .dat files (keyed by "geosite.dat" or "geoip.dat").
+// If a custom URL changed, the cached .dat file is removed so Ensure fetches the new source.
+func (s *Store) SetCustomDat(entries map[string]string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := make(map[string]string, len(entries))
+	for k, v := range entries {
+		k = strings.ToLower(strings.TrimSpace(k))
+		v = strings.TrimSpace(v)
+		if (k != "geosite.dat" && k != "geoip.dat") || v == "" {
+			continue
+		}
+		next[k] = v
+		if prev, ok := s.CustomDat[k]; !ok || prev != v {
+			_ = os.Remove(s.Path(k))
+		}
+	}
+	s.CustomDat = next
 }
 
 // SetCustomSRS updates custom download URLs keyed by "geosite:<code>" or "geoip:<code>".
@@ -96,6 +120,14 @@ func defaultSRSURLs(kind, code string) []string {
 			"https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
 		}
 	}
+	if kind == "geoip" && strings.EqualFold(code, "cn") {
+		return []string{
+			"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs",
+			"https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
+			"https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
+			"https://cdn.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-cn.srs",
+		}
+	}
 	name := kind + "-" + code + ".srs"
 	repo := "sing-geosite"
 	if kind == "geoip" {
@@ -143,7 +175,7 @@ func (s *Store) Ensure(ctx context.Context, geosite, geoip []string, cores ...st
 			needDat["geoip.dat"] = true
 		}
 		for name := range needDat {
-			if err := s.ensureFile(ctx, name, s.DatURLs[name], s.minSize(name), false); err != nil {
+			if err := s.ensureFile(ctx, name, s.datURLs(name), s.minSize(name), false); err != nil {
 				return err
 			}
 		}
@@ -231,8 +263,23 @@ func (s *Store) srsURLs(kind, code string) []string {
 	return base
 }
 
+func (s *Store) datURLs(name string) []string {
+	base := s.DatURLs[name]
+	if custom := strings.TrimSpace(s.CustomDat[strings.ToLower(strings.TrimSpace(name))]); custom != "" {
+		out := make([]string, 0, 1+len(base))
+		out = append(out, custom)
+		for _, u := range base {
+			if u != custom {
+				out = append(out, u)
+			}
+		}
+		return out
+	}
+	return base
+}
+
 func (s *Store) urlsFor(name string) ([]string, int64) {
-	if urls := s.DatURLs[name]; len(urls) > 0 {
+	if urls := s.datURLs(name); len(urls) > 0 {
 		return urls, s.minSize(name)
 	}
 	base := strings.TrimSuffix(name, ".srs")
