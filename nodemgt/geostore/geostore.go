@@ -22,15 +22,42 @@ const (
 
 // Store keeps Xray geoip.dat/geosite.dat and sing-box rule-set files beside the agent config.
 type Store struct {
-	Dir     string
-	Client  *http.Client
-	DatURLs map[string][]string
-	SRSURLs func(kind, code string) []string
-	MinDat  int64
-	MinSRS  int64
-	MaxAge  time.Duration
+	Dir       string
+	Client    *http.Client
+	DatURLs   map[string][]string
+	SRSURLs   func(kind, code string) []string
+	CustomSRS map[string]string
+	MinDat    int64
+	MinSRS    int64
+	MaxAge    time.Duration
 
 	mu sync.Mutex
+}
+
+// SetCustomSRS updates custom download URLs keyed by "geosite:<code>" or "geoip:<code>".
+// If a rule's custom URL changed, its cached .srs file is removed so Ensure fetches the new source.
+func (s *Store) SetCustomSRS(entries map[string]string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := make(map[string]string, len(entries))
+	for k, v := range entries {
+		k = strings.ToLower(strings.TrimSpace(k))
+		v = strings.TrimSpace(v)
+		if k == "" || v == "" {
+			continue
+		}
+		next[k] = v
+		if prev, ok := s.CustomSRS[k]; !ok || prev != v {
+			kind, code, okCut := strings.Cut(k, ":")
+			if okCut && (kind == "geosite" || kind == "geoip") && code != "" {
+				_ = os.Remove(s.Path(RuleSetFile(kind, code)))
+			}
+		}
+	}
+	s.CustomSRS = next
 }
 
 func Open(dir string) (*Store, error) {
@@ -184,10 +211,24 @@ func (s *Store) RefreshStale(ctx context.Context) {
 }
 
 func (s *Store) srsURLs(kind, code string) []string {
+	var base []string
 	if s.SRSURLs == nil {
-		return defaultSRSURLs(kind, code)
+		base = defaultSRSURLs(kind, code)
+	} else {
+		base = s.SRSURLs(kind, code)
 	}
-	return s.SRSURLs(kind, code)
+	key := strings.ToLower(strings.TrimSpace(kind)) + ":" + strings.ToLower(strings.TrimSpace(code))
+	if custom := strings.TrimSpace(s.CustomSRS[key]); custom != "" {
+		out := make([]string, 0, 1+len(base))
+		out = append(out, custom)
+		for _, u := range base {
+			if u != custom {
+				out = append(out, u)
+			}
+		}
+		return out
+	}
+	return base
 }
 
 func (s *Store) urlsFor(name string) ([]string, int64) {

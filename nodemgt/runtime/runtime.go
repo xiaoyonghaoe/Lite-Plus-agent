@@ -574,6 +574,12 @@ func (r *Runtime) applySnapshotModeWithOpLocked(payload json.RawMessage, mode sn
 		} `json:"certs"`
 		DialStack    string `json:"dial_stack"`
 		StatsEnabled bool   `json:"stats_enabled"`
+		GeoSources   []struct {
+			Kind    string `json:"kind"`
+			Code    string `json:"code"`
+			URL     string `json:"url"`
+			Enabled bool   `json:"enabled"`
+		} `json:"geo_sources"`
 	}
 	if err := json.Unmarshal(payload, &snap); err != nil {
 		return err
@@ -718,6 +724,20 @@ func (r *Runtime) applySnapshotModeWithOpLocked(payload json.RawMessage, mode sn
 		})
 	}
 	ctx := context.Background()
+	if len(snap.GeoSources) > 0 {
+		customSRS := make(map[string]string, len(snap.GeoSources))
+		for _, src := range snap.GeoSources {
+			if !src.Enabled || strings.TrimSpace(src.URL) == "" {
+				continue
+			}
+			k := strings.ToLower(strings.TrimSpace(src.Kind))
+			c := strings.ToLower(strings.TrimSpace(src.Code))
+			if (k == "geosite" || k == "geoip") && c != "" {
+				customSRS[k+":"+c] = strings.TrimSpace(src.URL)
+			}
+		}
+		r.geo.SetCustomSRS(customSRS)
+	}
 	if cores := usedCoreNames(inbounds); len(cores) > 0 {
 		if geosite, geoip := coreadapter.CollectGeo(rts); len(geosite) > 0 || len(geoip) > 0 {
 			if err := r.geo.Ensure(ctx, geosite, geoip, cores...); err != nil {
