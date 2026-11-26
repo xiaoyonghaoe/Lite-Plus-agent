@@ -1101,9 +1101,9 @@ func singBoxOutboundTransport(settings map[string]any) map[string]any {
 func singBoxHandshake(dest string) map[string]any {
 	host, port, err := net.SplitHostPort(dest)
 	if err != nil {
-		return map[string]any{"server": dest, "server_port": 443}
+		return map[string]any{"server": dest, "server_port": 443, "connect_timeout": "5s"}
 	}
-	item := map[string]any{"server": host}
+	item := map[string]any{"server": host, "connect_timeout": "5s"}
 	if n, convErr := strconv.Atoi(port); convErr == nil && n > 0 {
 		item["server_port"] = n
 	} else {
