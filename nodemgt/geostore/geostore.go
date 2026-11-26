@@ -62,6 +62,13 @@ func defaultDatURLs() map[string][]string {
 }
 
 func defaultSRSURLs(kind, code string) []string {
+	if kind == "geosite" && strings.EqualFold(code, "china-list") {
+		return []string{
+			"https://raw.githubusercontent.com/OriginVorfeed/singbox-china-list/main/geosite-cn.srs",
+			"https://cdn.jsdelivr.net/gh/OriginVorfeed/singbox-china-list@main/geosite-cn.srs",
+			"https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
+		}
+	}
 	name := kind + "-" + code + ".srs"
 	repo := "sing-geosite"
 	if kind == "geoip" {
